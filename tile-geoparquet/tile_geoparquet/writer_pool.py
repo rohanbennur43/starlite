@@ -57,7 +57,7 @@ def _interleave_bits_2d(x: np.ndarray, y: np.ndarray, bits: int) -> np.ndarray:
 
     return (part1by1(y) << 1) | part1by1(x)
 
-# ------------------------- Writer Pool (flush-once, MPF rounds) -------------------------
+# ------------------------- Writer Pool -------------------------
 
 class WriterPool:
     """
@@ -125,6 +125,12 @@ class WriterPool:
             logger.debug(f"[{tile_id}] Concatenating {len(batches)} batches.")
             full = pa.concat_tables(batches, promote=True)
             full = ensure_large_types(full, self.geom_col)
+
+            # 🔽 Drop the internal routing column if it exists
+            if "geo_parquet_tile_num" in full.column_names:
+                logger.debug(f"[{tile_id}] Dropping internal column 'geo_parquet_tile_num'")
+                full = full.drop(["geo_parquet_tile_num"])
+
             bbox, full = self._maybe_sort_and_bbox(full)
             full = self._with_updated_geo_metadata(full, bbox)
 
@@ -247,19 +253,11 @@ class WriterPool:
         geo = {}
         if geo_raw is not None:
             try:
-                geo = json.loads(geo_raw.decode("utf-8"))
+                geo = json.loads(geo_raw.decode("utf8"))
             except Exception:
-                pass
+                geo = {}
 
-        geo.setdefault("version", "1.0.0")
-        geo.setdefault("primary_column", self.geom_col)
-        geo.setdefault("columns", {})
-        col = geo["columns"].get(self.geom_col, {})
-        col.setdefault("encoding", "WKB")
-        col["bbox"] = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
-        geo["columns"][self.geom_col] = col
-        geo["bbox"] = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
+        geo["bbox"] = list(map(float, bbox))
+        meta[b"geo"] = json.dumps(geo).encode("utf8")
 
-        meta[b"geo"] = json.dumps(geo).encode("utf-8")
-        new_schema = schema.with_metadata(meta)
-        return tbl.replace_schema_metadata(new_schema.metadata)
+        return tbl.replace_schema_metadata(meta)

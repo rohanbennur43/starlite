@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Set, Dict
+from typing import Optional, Set, Dict, List
 import logging
 
 import pyarrow as pa
@@ -15,13 +15,15 @@ from .utils_large import ensure_large_types
 
 logger = logging.getLogger(__name__)
 
+_TILE_COL = "geo_parquet_tile_num"
+
 
 class _OverflowWriter:
     """
     Streams rows that don't fit in this round into a single overflow Parquet file.
 
-    - Defers opening ParquetWriter until the first batch arrives so we can
-      adopt the *transformed* (large_*) schema produced by ensure_large_types().
+    - Adds a persistent column 'geo_parquet_tile_num' to remember which tile each row belongs to.
+    - Defers ParquetWriter opening until the first batch.
     - Ensures parent directories exist before opening.
     """
     def __init__(self, path: Path, compression: str, geom_col: str):
@@ -31,48 +33,75 @@ class _OverflowWriter:
 
         self._pw: Optional[pq.ParquetWriter] = None
         self._rows = 0
-
-        # Make sure the parent dir exists (fixes FileNotFoundError).
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-    def write_batch(self, tbl: pa.Table) -> None:
-        if tbl is None or tbl.num_rows == 0:
-            return
+    # def write_batch(self, tbl: pa.Table, tile_id: Optional[str] = None) -> None:
+    #     if tbl is None or tbl.num_rows == 0:
+    #         return
 
-        # Ensure large types up front to avoid "offset overflow" on large binary/list.
-        tbl = tbl.combine_chunks()
-        tbl = ensure_large_types(tbl, geom_col=self.geom_col)
+    #     tbl = tbl.combine_chunks()
+    #     tbl = ensure_large_types(tbl, geom_col=self.geom_col)
 
-        if self._pw is None:
-            # Open the writer the moment we know the (possibly widened) schema.
-            logger.debug("Opening overflow writer at %s", self.path)
-            self._pw = pq.ParquetWriter(str(self.path), schema=tbl.schema, compression=self.compression)
+    #     # Inject persistent tile column if available
+    #     if tile_id is not None:
+    #         try:
+    #             tid_num = int(tile_id.split("_")[-1])
+    #         except Exception:
+    #             tid_num = -1
+    #         if _TILE_COL not in tbl.column_names:
+    #             col = pa.array([tid_num] * tbl.num_rows, type=pa.int32())
+    #             tbl = tbl.append_column(_TILE_COL, col)
 
-        self._pw.write_table(tbl)
-        self._rows += tbl.num_rows
+    #     if self._pw is None:
+    #         logger.debug("Opening overflow writer at %s", self.path)
+    #         self._pw = pq.ParquetWriter(str(self.path), schema=tbl.schema, compression=self.compression)
+
+    #     self._pw.write_table(tbl)
+    #     self._rows += tbl.num_rows
 
     def close(self) -> int:
         if self._pw is not None:
             self._pw.close()
         return self._rows
 
+    def write_batch(self, tbl: pa.Table, tile_id: Optional[str] = None) -> None:
+        if tbl is None or tbl.num_rows == 0:
+            return
+
+        tbl = tbl.combine_chunks()
+        tbl = ensure_large_types(tbl, geom_col=self.geom_col)
+
+        # Inject persistent tile column if available
+        if tile_id is not None:
+            try:
+                tid_num = int(tile_id.split("_")[-1])
+            except Exception:
+                tid_num = -1
+            if _TILE_COL not in tbl.column_names:
+                col = pa.array([tid_num] * tbl.num_rows, type=pa.int32())
+                tbl = tbl.append_column(_TILE_COL, col)
+                logger.debug(
+                    f"Added persistent tile column '{_TILE_COL}' for tile_id={tile_id} "
+                    f"({tbl.num_rows} rows)"
+                )
+            else:
+                logger.debug(
+                    f"Column '{_TILE_COL}' already present in batch for tile_id={tile_id}"
+                )
+
+        if self._pw is None:
+            logger.debug("Opening overflow writer at %s", self.path)
+            self._pw = pq.ParquetWriter(str(self.path), schema=tbl.schema, compression=self.compression)
+
+        self._pw.write_table(tbl)
+        self._rows += tbl.num_rows
+
 
 class RoundOrchestrator:
     """
-    Round-based tiler with bounded parallel writers:
-
-    - At most (max_parallel_files - 1) tiles are included in the current round; any other
-      tile rows are diverted to a single overflow file for this round.
-    - Within the round, we buffer all rows for the selected tiles (no per-row I/O).
-    - After all input is scanned, we flush the selected tiles once (WriterPool.flush_all).
-    - If the overflow file has rows, it becomes the input for the next round; repeat.
-    - Process ends when a round produces no overflow rows.
-
-    Notes:
-      * WriterPool is "flush-once": it concatenates, (optionally) sorts, recomputes bbox,
-        patches GeoParquet metadata, and writes one Parquet per tile.
-      * Overflow file is written progressively per batch to bound memory and to make
-        RSS reflect actual spill behavior.
+    Round-based tiler with bounded parallel writers.
+    Adds support for carrying forward per-row tile IDs across rounds using
+    'geo_parquet_tile_num' column in overflow files.
     """
 
     def __init__(
@@ -84,7 +113,7 @@ class RoundOrchestrator:
         compression: str = "zstd",
         geom_col: str = "geometry",
         sort_mode: str = "zorder",
-        sort_keys: Optional[str] = None,  # CLI passes raw string; WriterPool normalizes internally if needed
+        sort_keys: Optional[str] = None,
         sfc_bits: int = 16,
     ):
         self.source = source
@@ -96,26 +125,45 @@ class RoundOrchestrator:
         self.sort_mode = sort_mode
         self.sort_keys = sort_keys
         self.sfc_bits = int(sfc_bits)
-
-        # Source schema is used for reference/logging; WriterPool/Overflow may widen types.
         self.src_schema: pa.Schema = source.schema()
+
+    # ------------------------------------------------------------------
+
+    def _group_by_tile_column(self, batch: pa.Table) -> Dict[str, pa.Table]:
+        """Group a batch by the persistent tile column (geo_parquet_tile_num)."""
+        col = batch[_TILE_COL]
+        arr = col.to_numpy(zero_copy_only=False)
+        groups: Dict[int, List[int]] = {}
+        for i, v in enumerate(arr):
+            if v is None:
+                continue
+            try:
+                v_int = int(v)
+            except Exception:
+                continue
+            groups.setdefault(v_int, []).append(i)
+
+        out: Dict[str, pa.Table] = {}
+        for tid, idxs in groups.items():
+            out[f"tile_{tid:06d}"] = batch.take(pa.array(idxs, type=pa.int32()))
+        return out
+
+    # ------------------------------------------------------------------
 
     def _run_one_round(self, ds: DataSource, round_id: int) -> Optional[Path]:
         logger.info("Starting round %d", round_id)
         Path(self.outdir).mkdir(parents=True, exist_ok=True)
 
-        # Prepare pool for this round. It buffers everything and writes once per tile.
         pool = WriterPool(
             outdir=self.outdir,
             compression=self.compression,
             geom_col=self.geom_col,
-            max_parallel_files=self.max_parallel_files,  # used for concurrency during flush
+            max_parallel_files=self.max_parallel_files,
             sort_mode=self.sort_mode,
             sort_keys=self.sort_keys,
             sfc_bits=self.sfc_bits,
         )
 
-        # Overflow sink for tiles not admitted this round (bounded by cap below).
         overflow_path = Path(self.outdir) / f"_overflow_round_{round_id}.parquet"
         ow = _OverflowWriter(
             path=overflow_path,
@@ -123,20 +171,19 @@ class RoundOrchestrator:
             geom_col=self.geom_col,
         )
 
-        # Admit at most (max_parallel_files - 1) tiles into this round; the "last slot" is reserved
-        # conceptually for overflow (so we never exceed MPF) and to match your original semantics.
-        # (Since WriterPool buffers in memory, "open tiles" here means: tiles whose rows are kept
-        # for this round; all other tile rows spill to overflow.)
         open_tiles: Set[str] = set()
         cap = max(1, self.max_parallel_files - 1)
 
-        # Stream the input: partition each batch to tiles; decide keep/spill.
         for batch_idx, batch in enumerate(ds.iter_tables()):
-            parts: Dict[str, pa.Table] = self.assigner.partition_by_tile(batch)
-            logger.debug(
-                "Round %d: batch %d -> %d tiles (rows: %d)",
-                round_id, batch_idx, len(parts), batch.num_rows
-            )
+            # Check for persistent tile ID column
+            if _TILE_COL in batch.column_names:
+                parts = self._group_by_tile_column(batch)
+                logger.debug("Round %d: batch %d → reused cached tile IDs (%d tiles)",
+                             round_id, batch_idx, len(parts))
+            else:
+                parts = self.assigner.partition_by_tile(batch)
+                logger.debug("Round %d: batch %d → assigned fresh (%d tiles)",
+                             round_id, batch_idx, len(parts))
 
             for tile_id, sub in parts.items():
                 if tile_id in open_tiles or len(open_tiles) < cap:
@@ -145,10 +192,9 @@ class RoundOrchestrator:
                         open_tiles.add(tile_id)
                     pool.append(tile_id, sub)
                 else:
-                    # Spill this tile's rows to overflow for next round.
-                    ow.write_batch(sub)
+                    ow.write_batch(sub, tile_id=tile_id)
 
-        # Done scanning input for this round: flush current tiles once.
+        # Flush and handle overflow
         if open_tiles:
             logger.info(
                 "Round %d: flushing %d tiles (cap=%d, admitted=%d)",
@@ -159,23 +205,22 @@ class RoundOrchestrator:
 
         pool.flush_all()
 
-        # Close overflow and decide next input.
         overflow_rows = ow.close()
         if overflow_rows > 0:
             logger.info("Round %d: overflow file created at %s (rows=%d)",
                         round_id, overflow_path, overflow_rows)
             return overflow_path
 
-        # No overflow rows — if an empty file was created for any reason, remove it.
         if overflow_path.exists():
             try:
                 pf = pq.ParquetFile(str(overflow_path))
                 if pf.metadata.num_rows == 0:
                     overflow_path.unlink(missing_ok=True)
             except Exception:
-                # Best effort cleanup; ignore issues reading a partially-written file.
                 pass
         return None
+
+    # ------------------------------------------------------------------
 
     def run(self) -> None:
         round_id = 0
@@ -190,16 +235,13 @@ class RoundOrchestrator:
                 "Round %d produced overflow; continuing with overflow file %s",
                 round_id, overflow_path
             )
-            # Feed the overflow back as the next round's input.
             ds = GeoParquetSource(str(overflow_path))
             round_id += 1
 
-        # Final cleanup: remove any zero-row overflow files that might remain.
         for p in Path(self.outdir).glob("_overflow_round_*.parquet"):
             try:
                 pf = pq.ParquetFile(str(p))
                 if pf.metadata.num_rows == 0:
                     p.unlink(missing_ok=True)
             except Exception:
-                # Ignore errors on best-effort cleanup
                 pass
