@@ -1,0 +1,9 @@
+dataset/
+*_out/
+*.parquet
+*.venv*/
+*.csv*
+*.pyc
+original_datasets/
+*.DS_Store
+*-out/

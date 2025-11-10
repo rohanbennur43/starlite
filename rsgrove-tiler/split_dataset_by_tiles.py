@@ -1,27 +1,54 @@
+# 
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, os, sys, math, logging
+import argparse, os, logging, time
+from contextlib import contextmanager
+from queue import Queue
+from threading import Thread
+from typing import Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
+import psutil
+
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
-from shapely import from_wkb
-from shapely.geometry import Point
+import pyarrow.compute as pc
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+from shapely import from_wkb, wkb
+from shapely.geometry import Point, shape as shp_shape
+
+# ---------------- Logging ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("tile-writer")
 
+# ---------------- Memory instrumentation ----------------
+ARROW_POOL = pa.default_memory_pool()
+def arrow_bytes():
+    return ARROW_POOL.bytes_allocated()
+def rss_mb():
+    return psutil.Process(os.getpid()).memory_info().rss / (1024*1024)
+@contextmanager
+def mem_scope(tag: str, extra: dict | None = None):
+    b0, r0, t0 = arrow_bytes(), rss_mb(), time.time()
+    yield
+    payload = {
+        "tag": tag,
+        "arrow_MB": (arrow_bytes() - b0)/1e6,
+        "rss_MB": (rss_mb() - r0),
+        "sec": time.time() - t0,
+    }
+    if extra: payload.update(extra)
+    logger.info("MEM " + ",".join(f"{k}={payload[k]}" for k in payload))
+
+# ---------------- Tile helpers ----------------
 def load_index(index_csv: str):
     df = pd.read_csv(index_csv)
     required = ["ID","File Name","xmin","ymin","xmax","ymax"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise SystemExit(f"Index CSV missing columns: {missing}")
-    # tiles arrays
     mins = df[["xmin","ymin"]].to_numpy(float)  # (P,2)
     maxs = df[["xmax","ymax"]].to_numpy(float)  # (P,2)
     names = df["File Name"].astype(str).tolist()
@@ -30,156 +57,364 @@ def load_index(index_csv: str):
 
 def point_in_rect(x, y, mins, maxs):
     # returns index of the first rect containing the point or -1
-    # mins/maxs: (P,2)
     ge_minx = x >= mins[:,0]
     lt_maxx = x <  maxs[:,0]
     ge_miny = y >= mins[:,1]
     lt_maxy = y <  maxs[:,1]
-    hit = ge_minx & lt_maxx & ge_miny & lt_maxy  # (P,)
+    hit = ge_minx & lt_maxx & ge_miny & lt_maxy
     idx = np.flatnonzero(hit)
     return int(idx[0]) if idx.size else -1
 
-def rects_overlap(a_minx, a_miny, a_maxx, a_maxy, mins, maxs):
-    # vectorized: which tiles overlap this bbox? returns boolean mask (P,)
-    sep = (maxs[:,0] <= a_minx) | (a_maxx <= mins[:,0]) | \
-          (maxs[:,1] <= a_miny) | (a_maxy <= mins[:,1])
-    return ~sep
+# ---------------- Parallel writer worker ----------------
+class WriterWorker(Thread):
+    def __init__(self, wid: int, tasks: Queue, schema: pa.Schema,
+                 out_path_for, writer_props, row_group_size: int | None, tile_owner):
+        super().__init__(daemon=True)
+        self.wid = wid
+        self.tasks = tasks
+        self.schema = schema
+        self.out_path_for = out_path_for
+        self.writer_props = writer_props
+        self.row_group_size = row_group_size
+        self.tile_owner = tile_owner
+        self._writers: Dict[int, pq.ParquetWriter] = {}
 
+    def ensure_writer(self, tile_id: int) -> pq.ParquetWriter:
+        if self.tile_owner(tile_id) != self.wid:
+            raise RuntimeError(f"Tile {tile_id} not owned by worker {self.wid}")
+        w = self._writers.get(tile_id)
+        if w is None:
+            path = self.out_path_for(tile_id)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            w = pq.ParquetWriter(path, schema=self.schema,
+                                 writer_properties=self.writer_props, version="2.6")
+            self._writers[tile_id] = w
+        return w
+
+    def run(self):
+        while True:
+            item = self.tasks.get()
+            if item is None:
+                break
+            tile_id, table, rows = item
+            w = self.ensure_writer(tile_id)
+            with mem_scope("write", {"worker": self.wid, "tile": tile_id, "rows": rows}):
+                w.write_table(table, row_group_size=self.row_group_size)
+            self.tasks.task_done()
+
+    def Noclose_all(self):
+        for tile_id, w in self._writers.items():
+            try: w.close()
+            except Exception as e:
+                logger.warning(f"Close failed for tile {tile_id}: {e}")
+
+# ---------------- GeoJSON streaming (Fiona -> Arrow Table batches) ----------------
+def geojson_batch_iterator(path: str, batch_size: int, properties_schema: List[str] | None = None):
+    """
+    Yields (table, xs, ys, bxs, bys, bxe, bye) where:
+      - table: pyarrow.Table with columns [props..., 'geometry' (WKB bytes)]
+      - xs, ys: centroid arrays
+      - bxs, bys, bxe, bye: bbox arrays
+    properties_schema: optional ordered list of property keys to enforce column order.
+    """
+    import fiona
+    logger.info(f"Streaming GeoJSON from {path} ...")
+    with fiona.open(path, "r") as src:
+        try:
+            logger.info(f"GeoJSON feature count reported: {len(src):,}")
+        except Exception:
+            logger.info("GeoJSON feature count unknown (will stream).")
+
+        # Dynamic property columns (union of keys seen). Maintain order.
+        cols: List[str] = list(properties_schema) if properties_schema else []
+        data: Dict[str, List] = {k: [] for k in cols}
+        geom_wkb: List[bytes] = []
+        xs: List[float] = []; ys: List[float] = []
+        bxs: List[float] = []; bys: List[float] = []
+        bxe: List[float] = []; bye: List[float] = []
+
+        def flush_batch():
+            if not geom_wkb:
+                return None
+            # Build DataFrame with all current columns (fill missing with None)
+            df_dict = {k: v for k, v in data.items()}
+            df_dict["geometry"] = geom_wkb
+            df = pd.DataFrame(df_dict)
+            # Arrow Table
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            # Numpy arrays
+            arr_xs = np.asarray(xs, dtype=float)
+            arr_ys = np.asarray(ys, dtype=float)
+            arr_bxs = np.asarray(bxs, dtype=float)
+            arr_bys = np.asarray(bys, dtype=float)
+            arr_bxe = np.asarray(bxe, dtype=float)
+            arr_bye = np.asarray(bye, dtype=float)
+            # clear buffers
+            for k in data.keys(): data[k].clear()
+            geom_wkb.clear()
+            xs.clear(); ys.clear()
+            bxs.clear(); bys.clear(); bxe.clear(); bye.clear()
+            return table, arr_xs, arr_ys, arr_bxs, arr_bys, arr_bxe, arr_bye
+
+        for i, feat in enumerate(src):
+            props = feat.get("properties") or {}
+            geom_json = feat.get("geometry")
+            if not geom_json:
+                continue
+            g = shp_shape(geom_json)
+            if g.is_empty:
+                continue
+
+            # expand columns if new keys appear
+            for k in props.keys():
+                if k not in data:
+                    cols.append(k)
+                    data[k] = [None] * (len(geom_wkb))  # backfill existing rows
+            # append row values
+            for k in cols:
+                data[k].append(props.get(k, None))
+
+            # geometry → WKB, centroid, bbox
+            geom_wkb.append(wkb.dumps(g))
+            cx, cy = (g.x, g.y) if isinstance(g, Point) else (g.centroid.x, g.centroid.y)
+            xs.append(cx); ys.append(cy)
+            bx0, by0, bx1, by1 = g.bounds
+            bxs.append(bx0); bys.append(by0); bxe.append(bx1); bye.append(by1)
+
+            if len(geom_wkb) >= batch_size:
+                out = flush_batch()
+                if out is not None:
+                    yield out
+
+        # flush remainder
+        out = flush_batch()
+        if out is not None:
+            yield out
+
+# ---------------- Main ----------------
 def main():
-    ap = argparse.ArgumentParser(
-        description="Split a GeoParquet into per-tile Parquet files using tiles_index.csv"
-    )
-    ap.add_argument("input", help="Path to GeoParquet (dataset or file)")
-    ap.add_argument("index_csv", help="tiles_index.csv produced earlier")
+    ap = argparse.ArgumentParser(description="Split GeoParquet/GeoJSON into per-tile Parquet files (streaming, parallel, instrumented).")
+    ap.add_argument("input", help="Path to GeoParquet (dataset/file) or GeoJSON file")
+    ap.add_argument("index_csv", help="tiles_index.csv produced by tiler")
     ap.add_argument("out_dir", help="Output directory for per-tile Parquet files")
-    ap.add_argument("--geometry", default="geometry", help="Geometry column name (default: geometry)")
+
+    ap.add_argument("--input-type", choices=["auto","parquet","geojson"], default="auto",
+                    help="Force input type (default: auto by extension)")
+    ap.add_argument("--geometry", default="geometry",
+                    help="Geometry column name (Parquet input only; default: geometry)")
     ap.add_argument("--mode", choices=["disjoint","covering"], default="disjoint",
-                    help="Assignment mode: disjoint=by centroid to 1 tile; covering=write to all overlapping tiles")
-    ap.add_argument("--batch-size", type=int, default=100_000)
+                    help="disjoint: by centroid; covering: to all overlapping tiles")
+    ap.add_argument("--batch-size", type=int, default=100_000,
+                    help="Batch size for scanning (Parquet) or buffering (GeoJSON)")
+
+    # Writing / compression tuning
+    ap.add_argument("--row-group-size", type=int, default=None,
+                    help="Row group size (rows) for write_table")
+    ap.add_argument("--data-page-size", type=int, default=None,
+                    help="Target data page size in bytes")
+    ap.add_argument("--compression", default="zstd",
+                    choices=["zstd","snappy","gzip","brotli","lz4","none"])
     ap.add_argument("--suffix", default=".parquet",
-                    help="Output file suffix/extension (default .parquet)")
+                    help="Output file suffix (default .parquet)")
     ap.add_argument("--use-index-filenames", action="store_true",
                     help="Use 'File Name' from index CSV (with --suffix replacing its extension)")
+
+    # Parallelism
+    ap.add_argument("--workers", type=int, default=1, help="Number of writer workers (>=1)")
+    ap.add_argument("--queue-size", type=int, default=8, help="Queue size per worker")
+    ap.add_argument("--progress-interval", type=int, default=10, help="Log every N batches")
+
     args = ap.parse_args()
 
-    logger.info(f"Creating output directory: {args.out_dir}")
-    os.makedirs(args.out_dir, exist_ok=True)
+    # Decide input type
+    in_lower = args.input.lower()
+    if args.input_type == "auto":
+        if in_lower.endswith(".parquet") or os.path.isdir(args.input):
+            input_type = "parquet"
+        elif in_lower.endswith(".geojson") or in_lower.endswith(".json"):
+            input_type = "geojson"
+        else:
+            raise SystemExit("Cannot infer input type; use --input-type.")
+    else:
+        input_type = args.input_type
 
-    logger.info(f"Loading tile index from: {args.index_csv}")
-    tile_ids, tile_names, mins, maxs, index_df = load_index(args.index_csv)
+    logger.info(f"Input type: {input_type.upper()}; batch_size={args.batch_size}; mode={args.mode}")
+
+    # Load tile index
+    tile_ids, tile_names, mins, maxs, _ = load_index(args.index_csv)
     P = len(tile_ids)
-    logger.info(f"Loaded {P} tiles from index CSV")
+    logger.info(f"Loaded {P} tiles from index")
 
-    logger.info(f"Preparing input dataset: {args.input}")
-    dataset = ds.dataset(args.input, format="parquet")
-    schema: pa.Schema = dataset.schema
-    logger.info(f"Dataset schema columns: {schema.names}")
-    if args.geometry not in schema.names:
-        logger.error(f"Geometry column '{args.geometry}' not in dataset. Columns: {schema.names}")
-        raise SystemExit(f"Geometry column '{args.geometry}' not in dataset. Columns: {schema.names}")
-
-    # Prepare writers per tile (lazy open)
-    writers: list[pq.ParquetWriter | None] = [None] * P
-    counts = np.zeros(P, dtype=np.int64)
-
+    # Output path helper
     def out_path_for(i: int) -> str:
         if args.use_index_filenames:
             base = os.path.splitext(tile_names[i])[0]
             return os.path.join(args.out_dir, base + args.suffix)
         else:
             return os.path.join(args.out_dir, f"part-{tile_ids[i]:05d}{args.suffix}")
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    def ensure_writer(i: int):
-        if writers[i] is None:
-            # preserve original schema & metadata
-            writers[i] = pq.ParquetWriter(out_path_for(i), schema=schema, version="2.6",
-                                          compression="zstd", write_statistics=True)
-        return writers[i]
+    # Writer properties
+    wpb = pq.WriterProperties.builder()
+    if args.compression != "none":
+        wpb = wpb.compression(args.compression)
+    wpb = wpb.write_statistics(True)
+    if args.data_page_size:
+        wpb = wpb.data_page_size(args.data_page_size)
+    writer_props = wpb.build()
 
-    # Streaming over batches
-    scanner = dataset.scanner(batch_size=args.batch_size)  # all columns
+    # Tile ownership across workers
+    W = max(1, args.workers)
+    def owner_of_tile(tile_id: int) -> int:
+        return tile_id % W
+
+    # Stats
+    counts = np.zeros(P, dtype=np.int64)
     total = 0
     assigned = 0
-    logger.info(f"Starting batch scan with batch_size={args.batch_size}")
-    batch_num = 0
-    for batch in scanner.to_batches():
-        batch_num += 1
-        n = batch.num_rows
-        logger.info(f"Processing batch {batch_num} with {n} rows.")
-        if n == 0:
-            logger.info(f"Batch {batch_num} is empty, skipping.")
-            continue
-        total += n
 
-        # geometry column as numpy object array of bytes (or None)
-        wkb_arr: pa.Array = batch.column(args.geometry)
-        wkb_np = wkb_arr.to_numpy(zero_copy_only=False)  # dtype=object
+    # ---------- PARQUET PATH ----------
+    if input_type == "parquet":
+        dataset = ds.dataset(args.input, format="parquet")
+        schema: pa.Schema = dataset.schema
+        if args.geometry not in schema.names:
+            raise SystemExit(f"Geometry column '{args.geometry}' not in dataset. Columns: {schema.names}")
 
-        # shapely vectorized parse; compute centroids & bboxes
-        geoms = from_wkb(wkb_np)
-        valid_mask = np.array([g is not None and not g.is_empty for g in geoms], dtype=bool)
-        logger.info(f"Batch {batch_num}: {valid_mask.sum()} valid geometries out of {n}.")
-        if not np.any(valid_mask):
-            logger.info(f"Batch {batch_num} has no valid geometries, skipping.")
-            continue
+        # Start workers now (schema known)
+        queues = [Queue(maxsize=args.queue_size) for _ in range(W)]
+        workers = [WriterWorker(k, queues[k], schema, out_path_for, writer_props,
+                                args.row_group_size, owner_of_tile) for k in range(W)]
+        logger.info(f"Starting {W} writer workers")
+        for w in workers: w.start()
 
-        geoms = geoms[valid_mask]
-        sub_batch = batch.filter(pa.array(valid_mask))  # keep rows in sync
+        scanner = dataset.scanner(batch_size=args.batch_size)  # all columns
+        logger.info("Scanning Parquet ...")
+        for b_idx, batch in enumerate(scanner.to_batches(), start=1):
+            n = batch.num_rows
+            with mem_scope("batch", {"batch": b_idx, "rows": n}):
+                if n == 0: continue
+                total += n
 
-        if args.mode == "disjoint":
-            logger.info(f"Batch {batch_num}: Assigning features to tiles by centroid.")
-            xs = np.array([g.x if isinstance(g, Point) else g.centroid.x for g in geoms], dtype=float)
-            ys = np.array([g.y if isinstance(g, Point) else g.centroid.y for g in geoms], dtype=float)
-
-            # Assign per feature
-            tile_idx = np.full(xs.shape[0], -1, dtype=int)
-            for j in range(xs.shape[0]):
-                tile_idx[j] = point_in_rect(xs[j], ys[j], mins, maxs)
-            logger.info(f"Batch {batch_num}: Assigned {np.count_nonzero(tile_idx >= 0)} features to tiles.")
-
-            # write per tile
-            for i in range(P):
-                sel = tile_idx == i
-                if not np.any(sel):
+                wkb_arr: pa.Array = batch.column(args.geometry)
+                wkb_np = wkb_arr.to_numpy(zero_copy_only=False)
+                geoms = from_wkb(wkb_np)
+                valid_mask = np.array([g is not None and not g.is_empty for g in geoms], dtype=bool)
+                if not np.any(valid_mask):
                     continue
-                writer = ensure_writer(i)
-                taken = sub_batch.filter(pa.array(sel.tolist()))
-                writer.write_table(pa.Table.from_batches([taken]))
-                c = int(sel.sum())
-                counts[i] += c
-                assigned += c
-                logger.info(f"Batch {batch_num}: Wrote {c} rows to tile {i}.")
 
-        else:  # covering mode
-            logger.info(f"Batch {batch_num}: Assigning features to all overlapping tiles by bbox.")
-            bxs = np.array([g.bounds[0] for g in geoms], dtype=float)
-            bys = np.array([g.bounds[1] for g in geoms], dtype=float)
-            bxe = np.array([g.bounds[2] for g in geoms], dtype=float)
-            bye = np.array([g.bounds[3] for g in geoms], dtype=float)
+                geoms = geoms[valid_mask]
+                # Arrow Table from filtered batch
+                sub_batch = batch.filter(pa.array(valid_mask))
+                table = pa.Table.from_batches([sub_batch])
 
-            # For each tile, select overlapping rows and write
-            for i in range(P):
-                sep = (maxs[i,0] <= bxs) | (bxe <= mins[i,0]) | (maxs[i,1] <= bys) | (bye <= mins[i,1])
-                sel = ~sep
-                if not np.any(sel):
-                    continue
-                writer = ensure_writer(i)
-                taken = sub_batch.filter(pa.array(sel.tolist()))
-                writer.write_table(pa.Table.from_batches([taken]))
-                c = int(sel.sum())
-                counts[i] += c
-                assigned += c
-                logger.info(f"Batch {batch_num}: Wrote {c} rows to tile {i}.")
+                if args.mode == "disjoint":
+                    xs = np.array([g.x if isinstance(g, Point) else g.centroid.x for g in geoms], dtype=float)
+                    ys = np.array([g.y if isinstance(g, Point) else g.centroid.y for g in geoms], dtype=float)
+                    tile_idx = np.full(xs.shape[0], -1, dtype=int)
+                    for j in range(xs.shape[0]):
+                        tile_idx[j] = point_in_rect(xs[j], ys[j], mins, maxs)
 
-    # Close writers
-    logger.info("Closing tile writers and finalizing output files.")
-    for i, w in enumerate(writers):
-        if w is not None:
-            w.close()
-            logger.info(f"Wrote tile {i} → {out_path_for(i)} ({counts[i]} rows)")
+                    for i in range(P):
+                        sel = tile_idx == i
+                        if not np.any(sel): continue
+                        # filter the Arrow table by boolean mask
+                        taken = table.filter(pa.array(sel.tolist()))
+                        c = int(sel.sum()); counts[i] += c; assigned += c
+                        queues[owner_of_tile(i)].put((i, taken, c))
+                else:
+                    bxs = np.array([g.bounds[0] for g in geoms], dtype=float)
+                    bys = np.array([g.bounds[1] for g in geoms], dtype=float)
+                    bxe = np.array([g.bounds[2] for g in geoms], dtype=float)
+                    bye = np.array([g.bounds[3] for g in geoms], dtype=float)
+                    for i in range(P):
+                        sep = (maxs[i,0] <= bxs) | (bxe <= mins[i,0]) | (maxs[i,1] <= bys) | (bye <= mins[i,1])
+                        sel = ~sep
+                        if not np.any(sel): continue
+                        taken = table.filter(pa.array(sel.tolist()))
+                        c = int(sel.sum()); counts[i] += c; assigned += c
+                        queues[owner_of_tile(i)].put((i, taken, c))
 
-    logger.info(f"Done. Total rows seen: {total}, rows written: {assigned} "
-                f"(mode={args.mode}, tiles={P})")
+            if (b_idx % args.progress_interval) == 0:
+                logger.info(f"Progress: batches={b_idx}, total_rows={total:,}, assigned_rows={assigned:,}, "
+                            f"arrow_MB_now={arrow_bytes()/1e6:.1f}, rss_MB_now={rss_mb():.1f}")
+
+        logger.info("Draining writer queues ...")
+        for q in queues: q.join()
+        for q in queues: q.put(None)
+        for w in workers: w.join()
+        for w in workers: w.close_all()
+
+    # ---------- GEOJSON PATH ----------
+    else:
+        # We don’t know the schema until the first batch is materialized.
+        logger.info("Streaming GeoJSON ...")
+        first = True
+        queues = None
+        workers = None
+
+        b_idx = 0
+        for (table, xs_arr, ys_arr, bxs, bys, bxe, bye) in geojson_batch_iterator(args.input, args.batch_size):
+            b_idx += 1
+            n = table.num_rows
+            with mem_scope("batch", {"batch": b_idx, "rows": n}):
+                if n == 0: continue
+                total += n
+
+                # Initialize workers once schema is known
+                if first:
+                    schema = table.schema
+                    queues = [Queue(maxsize=args.queue_size) for _ in range(W)]
+                    workers = [WriterWorker(k, queues[k], schema, out_path_for, writer_props,
+                                            args.row_group_size, owner_of_tile) for k in range(W)]
+                    logger.info(f"Starting {W} writer workers (schema discovered from GeoJSON batch 1)")
+                    for w in workers: w.start()
+                    first = False
+
+                if args.mode == "disjoint":
+                    tile_idx = np.full(xs_arr.shape[0], -1, dtype=int)
+                    for j in range(xs_arr.shape[0]):
+                        tile_idx[j] = point_in_rect(xs_arr[j], ys_arr[j], mins, maxs)
+                    for i in range(P):
+                        sel = tile_idx == i
+                        if not np.any(sel): continue
+                        taken = table.filter(pa.array(sel.tolist()))
+                        c = int(sel.sum()); counts[i] += c; assigned += c
+                        queues[owner_of_tile(i)].put((i, taken, c))
+                else:
+                    for i in range(P):
+                        sep = (maxs[i,0] <= bxs) | (bxe <= mins[i,0]) | (maxs[i,1] <= bys) | (bye <= mins[i,1])
+                        sel = ~sep
+                        if not np.any(sel): continue
+                        taken = table.filter(pa.array(sel.tolist()))
+                        c = int(sel.sum()); counts[i] += c; assigned += c
+                        queues[owner_of_tile(i)].put((i, taken, c))
+
+            if (b_idx % args.progress_interval) == 0:
+                logger.info(f"Progress: batches={b_idx}, total_rows={total:,}, assigned_rows={assigned:,}, "
+                            f"arrow_MB_now={arrow_bytes()/1e6:.1f}, rss_MB_now={rss_mb():.1f}")
+
+        if first:
+            logger.info("No rows found in GeoJSON (nothing written).")
+        else:
+            logger.info("Draining writer queues ...")
+            for q in queues: q.join()
+            for q in queues: q.put(None)
+            for w in workers: w.join()
+            for w in workers: w.close_all()
+
+    # Final per-tile report
+    for i in range(P):
+        path = out_path_for(i)
+        if os.path.exists(path):
+            try:
+                sz_mb = os.path.getsize(path) / (1024*1024)
+                logger.info(f"Tile {i} → {path} ({counts[i]} rows, {sz_mb:.1f} MB)")
+            except Exception:
+                logger.info(f"Tile {i} → {path} ({counts[i]} rows)")
+
+    logger.info(f"Done. Total rows seen: {total:,}, rows written: {assigned:,} "
+                f"(mode={args.mode}, tiles={P}, workers={W})")
 
 if __name__ == "__main__":
     main()
+

@@ -70,7 +70,6 @@ if __name__ == "__main__":
     master = sys.argv[1]
     geometry_only = (len(sys.argv) == 3 and sys.argv[2] == "geometry_only")
     columns = ["geometry"] if geometry_only else None
-
     total_rows = count_rows_fast(master)
     print(f"[INFO] Master rows (fast): {total_rows:,}")
     print(f"[INFO] Columns: {'geometry only' if columns else 'all columns'}")

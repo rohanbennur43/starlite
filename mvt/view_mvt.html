@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Local MVT Viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link href="https://unpkg.com/maplibre-gl@3.6.0/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/maplibre-gl@3.6.0/dist/maplibre-gl.js"></script>
+<style>
+  body { margin: 0; padding: 0; }
+  #map { width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script>
+  const map = new maplibregl.Map({
+    container: 'map',
+    style: {
+      version: 8,
+      sources: {
+        basemap: {
+          type: 'raster',
+          tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+          tileSize: 256
+        },
+        local: {
+          type: 'vector',
+          tiles: ['http://localhost:8080/{z}/{x}/{y}.mvt'],
+          minzoom: 0,
+          maxzoom: 14
+        }
+      },
+      layers: [
+        // 🗺️ Base
+        {
+          id: 'basemap',
+          type: 'raster',
+          source: 'basemap'
+        },
+        // 🧩 Filled polygons (semi-transparent)
+        {
+          id: 'layer0-fill',
+          type: 'fill',
+          source: 'local',
+          'source-layer': 'layer0',
+          paint: {
+            'fill-color': '#0080ff',
+            'fill-opacity': 0.15
+          }
+        },
+        // 🧱 Thick outlines on top
+        {
+          id: 'layer0-outline',
+          type: 'line',
+          source: 'local',
+          'source-layer': 'layer0',
+          paint: {
+            'line-color': '#003366',
+            'line-width': 1,     // 👈 make this larger for thicker borders
+            'line-opacity': 0.9
+          }
+        }
+      ]
+    },
+    center: [-120, 37],
+    zoom: 6
+  });
+
+  map.addControl(new maplibregl.NavigationControl());
+</script>
+</body>
+</html>
