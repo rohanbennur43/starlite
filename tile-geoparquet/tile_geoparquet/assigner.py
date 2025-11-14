@@ -73,8 +73,6 @@ class TileAssignerFromCSV:
 
 # ---------------------------------------------------------------------------
 # RSGrove-based assigner (streaming sampling)
-#   - Writes partition MBRs to rsgrove_partitions_debug.csv for verification
-#   - CONTAINS-ONLY routing (inclusive eps): rows not fully contained are skipped
 # ---------------------------------------------------------------------------
 
 class RSGroveAssigner:
@@ -107,11 +105,7 @@ class RSGroveAssigner:
         sample_ratio: float = 1.0,
         sample_cap: Optional[int] = None,
     ) -> "RSGroveAssigner":
-        """
-        Build an RSGrovePartitioner from a streaming source with centroid sampling.
-        """
         options = options or BeastOptions()
-        # Ensure boxes don't expand to infinity: prevents overlapping tiles at domain edges
         options[RSGrovePartitioner.ExpandToInfinity] = False
 
         rng = np.random.default_rng(seed)
@@ -153,34 +147,25 @@ class RSGroveAssigner:
             if geom_col not in t.column_names or t.num_rows == 0:
                 continue
 
-            # upgrade to large_* early to avoid overflow in later takes/concats
             t = ensure_large_types(t, geom_col)
             geoms = from_wkb(t[geom_col].to_numpy(zero_copy_only=False))
-            batch_start = n_seen
 
             for g in geoms:
                 if g is None or g.is_empty:
                     continue
                 minx, miny, maxx, maxy = g.bounds
-                if minx < mins[0]: mins[0] = minx
-                if miny < mins[1]: mins[1] = miny
-                if maxx > maxs[0]: maxs[0] = maxx
-                if maxy > maxs[1]: maxs[1] = maxy
-
+                mins = np.minimum(mins, (minx, miny))
+                maxs = np.maximum(maxs, (maxx, maxy))
                 c = g.centroid
                 reservoir_add(n_seen + 1, float(c.x), float(c.y))
                 n_seen += 1
 
         if not X_s:
-            raise ValueError("No geometries sampled to build RSGrove index. "
-                             "Increase --sample-ratio or provide --sample-cap.")
+            raise ValueError("No geometries sampled to build RSGrove index.")
         logger.info("Sampling complete: total_seen=%d, total_sampled=%d, batches=%d",
                     n_seen, len(X_s), n_batches)
 
-        sample_points = np.stack(
-            [np.asarray(X_s, dtype=np.float64), np.asarray(Y_s, dtype=np.float64)],
-            axis=0
-        )
+        sample_points = np.stack([np.asarray(X_s, dtype=np.float64), np.asarray(Y_s, dtype=np.float64)], axis=0)
 
         class _Summary2D:
             def __init__(self, mins, maxs):
@@ -193,7 +178,7 @@ class RSGroveAssigner:
         summary = _Summary2D(mins, maxs)
 
         part = RSGrovePartitioner()
-        part.setup(options, True)  # disjoint
+        part.setup(options, True)
         part.construct(summary, sample_points, None, int(num_partitions))
 
         P = part.numPartitions()
@@ -204,10 +189,9 @@ class RSGroveAssigner:
             boxes.append((pid, float(tmp.mins[0]), float(tmp.mins[1]), float(tmp.maxs[0]), float(tmp.maxs[1])))
 
         df = pd.DataFrame(boxes, columns=["pid", "minx", "miny", "maxx", "maxy"])
-        debug_path = "rsgrove_partitions_debug.csv"
         try:
-            df.to_csv(debug_path, index=False)
-            logger.info("Wrote RSGrove partition MBRs to %s", debug_path)
+            df.to_csv("rsgrove_partitions_debug.csv", index=False)
+            logger.info("Wrote RSGrove partition MBRs to rsgrove_partitions_debug.csv")
         except Exception as e:
             logger.warning("Failed to write partition debug CSV: %s", e)
 
@@ -231,11 +215,11 @@ class RSGroveAssigner:
         xmin, ymin, xmax, ymax = bbox
         return (gminx >= xmin - eps) and (gminy >= ymin - eps) and (gmaxx <= xmax + eps) and (gmaxy <= ymax + eps)
 
-    def partition_by_tile(self, tbl: pa.Table) -> Dict[str, pa.Table]:
+    def partition_by_tile(self, tbl: pa.Table, contains_only: bool = True) -> Dict[str, pa.Table]:
         """
-        CONTAINS-ONLY assignment:
-          - Assign a row to the smallest-area tile whose MBR fully contains the row's bbox.
-          - If none contains, the row is SKIPPED.
+        Assign each geometry to the smallest-area tile that either:
+          • fully contains it  (if contains_only=True)
+          • intersects it      (if contains_only=False)
         """
         if tbl.num_rows == 0:
             return {}
@@ -258,12 +242,18 @@ class RSGroveAssigner:
 
             chosen_pid = None
             chosen_area = float("inf")
+
             for pid, xmin, ymin, xmax, ymax in self._boxes:
-                if self._contains_inclusive((xmin, ymin, xmax, ymax), gminx, gminy, gmaxx, gmaxy):
-                    area = self._areas[pid]
-                    if area < chosen_area:
-                        chosen_area = area
-                        chosen_pid = pid
+                if contains_only:
+                    ok = self._contains_inclusive((xmin, ymin, xmax, ymax), gminx, gminy, gmaxx, gmaxy)
+                else:
+                    ok = not (gmaxx < xmin or gminx > xmax or gmaxy < ymin or gminy > ymax)
+                if not ok:
+                    continue
+                area = self._areas[pid]
+                if area < chosen_area:
+                    chosen_area = area
+                    chosen_pid = pid
 
             if chosen_pid is None:
                 skipped += 1
@@ -276,6 +266,7 @@ class RSGroveAssigner:
         for pid, idxs in row_ids_by_pid.items():
             out[f"tile_{pid:06d}"] = t.take(pa.array(idxs, type=pa.int32()))
 
-        logger.info("partition_by_tile (contains-only): input_rows=%d, assigned=%d, skipped=%d, tiles=%d",
-                    t.num_rows, assigned, skipped, len(out))
+        mode = "contains-only" if contains_only else "intersects"
+        logger.info("partition_by_tile (%s): input_rows=%d, assigned=%d, skipped=%d, tiles=%d",
+                    mode, t.num_rows, assigned, skipped, len(out))
         return out

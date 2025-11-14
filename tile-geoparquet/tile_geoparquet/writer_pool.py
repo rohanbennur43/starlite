@@ -9,6 +9,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, Union
+from threading import Lock  # 🔒 added for thread safety
 
 import numpy as np
 import pyarrow as pa
@@ -64,6 +65,8 @@ class WriterPool:
     Buffer-everything writer:
       - append(tile_id, table): buffer Arrow Tables per tile (no IO)
       - flush_all(): writes once, in rounds of up to `max_parallel_files` concurrent files
+
+    Now thread-safe (per-tile locks) for parallel overflow reading.
     """
 
     def __init__(
@@ -94,19 +97,29 @@ class WriterPool:
             self.max_parallel_files = max(1, int(max_parallel_files))
 
         self._buffers: Dict[str, List[pa.Table]] = defaultdict(list)
+        self._locks: Dict[str, Lock] = defaultdict(Lock)  # 🔒 per-tile lock
+        self._rows_total = 0
 
     # --------------------------- Public API ---------------------------
 
     def append(self, tile_id: str, table: pa.Table) -> None:
+        """Thread-safe append of an Arrow Table batch to the tile buffer."""
         if table is None or table.num_rows == 0:
             return
         if self.geom_col not in table.column_names:
             raise ValueError(f"WriterPool.append: missing geometry column '{self.geom_col}'")
+
         table = table.combine_chunks()
         table = ensure_large_types(table, self.geom_col)
-        self._buffers[tile_id].append(table)
+
+        lock = self._locks[tile_id]
+        with lock:  # 🔒 safe concurrent append
+            self._buffers[tile_id].append(table)
+            self._rows_total += table.num_rows
+            logger.debug(f"[{tile_id}] Buffered {table.num_rows} rows (total={self._rows_total})")
 
     def flush_all(self) -> None:
+        """Flush all buffered tiles to disk."""
         if not self._buffers:
             logger.info("WriterPool.flush_all(): no buffered tiles to flush.")
             return
@@ -156,7 +169,7 @@ class WriterPool:
                     except Exception as e:
                         logger.error(f"Error writing tile {futs[f]}: {e}")
 
-        logger.info("WriterPool.flush_all(): all tiles successfully flushed to disk.")
+        logger.info(f"WriterPool.flush_all(): completed {total} tiles total={self._rows_total} rows.")
 
     def close(self) -> None:
         self.flush_all()
