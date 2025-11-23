@@ -7,7 +7,7 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 @app.get("/<dataset>/<int:z>/<int:x>/<int:y>.mvt")
 def serve_tile(dataset, z, x, y):
-    tiler = VectorTiler(f"datasets/{dataset}")
+    tiler = VectorTiler(f"../datasets/{dataset}")
     tile_bytes = tiler.get_tile(z, x, y)
     return Response(tile_bytes, mimetype="application/vnd.mapbox-vector-tile")
 

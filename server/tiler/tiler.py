@@ -8,7 +8,7 @@ class VectorTiler:
     def __init__(self, dataset_root):
         self.dataset_root = Path(dataset_root)
         self.parquet_dir = self.dataset_root / "parquet_tiles"
-        self.mvt_dir = self.dataset_root / "mvt_tiles"
+        self.mvt_dir = self.dataset_root / "mvt"
         self.index = ParquetIndex(self.parquet_dir)
 
     def tile_path(self, z, x, y):

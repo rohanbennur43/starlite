@@ -3,7 +3,8 @@ dataset/
 *.parquet
 *.venv*/
 *.csv*
-*.pyc
+*pyc
 original_datasets/
 *.DS_Store
 *-out/
+logs.txt
