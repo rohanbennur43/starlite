@@ -44,6 +44,9 @@ tiles:
 		--sort-mode zorder \
 		--sample-ratio 0.1 \
 		> $(LOGFILE) 2>&1
+	
+	$(PYTHON) mvt/mvt.py \
+		--dir $(TILES)
 
 mvt:
 	$(PYTHON) mvt/mvt.py \

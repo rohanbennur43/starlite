@@ -1,110 +1,69 @@
 # Tile Geoparquet Pipeline
 
-This project creates tiled GeoParquet datasets and vector tiles from any input GeoParquet or GeoJSON file.
-It also includes a small development server for previewing the generated tiles.
+This project converts any GeoJSON or GeoParquet file into tiled GeoParquet, then automatically generates MVT vector tiles and histogram grids. It also includes a small development server and web viewer.
 
 ## Requirements
-
 Install dependencies:
-
 pip install -r requirements.txt
 
-## Directory structure
-
-The pipeline expects the following layout:
-
+## Directory Structure
 project/
-    Makefile
-    tile_geoparquet/
-    mvt/
-    server/
-    datasets/          output GeoParquet tiles
-    mvt_out/           output MVT tiles
+  Makefile
+  tile_geoparquet/
+  mvt/
+  server/
+  datasets/          # GeoParquet tiles (auto created)
+  mvt_out/           # MVT tiles (auto created)
+  requirements.txt
 
-You can place your input dataset anywhere, as long as you pass the path to make tiles.
+## Full Pipeline
+You must run BOTH steps:  
+1) GeoParquet tiling  
+2) MVT tile generation  
 
-## Tiling a dataset
-
-Run the tiler:
-
+### Step 1. Tiling a Dataset
+Run:
 make tiles INPUT=path/to/your/data.parquet
 
 Example:
-
 make tiles INPUT=../extras/original_datasets/highways/roads.parquet
 
-The Makefile will:
+This will:
+1. Extract dataset name (roads.parquet → roads)
+2. Generate GeoParquet tiles in datasets/roads/
+3. Generate histogram grids for rendering and analysis
+4. Store logs in logs_roads.txt
 
-1. Extract the dataset name from the input file, for example roads.parquet becomes roads.
-2. Run the tiling pipeline and generate GeoParquet tiles inside:
-
-datasets/roads/
-
-3. Automatically generate histogram data used for visualization and analysis.
-4. Write logs to:
-
-logs_roads.txt
-
-## Generating MVT tiles
-
-After GeoParquet tiles are created, run:
-
+### Step 2. Generate MVT Tiles (required)
+After step 1, run:
 make mvt INPUT=path/to/your/data.parquet
 
-This reads the dataset from:
+This reads tiles from:
+datasets/<dataset_name>/
+And writes vector tiles to:
+mvt_out/<dataset_name>/
 
-datasets/<dataset_name>
+These MVT tiles are required for viewing data in the frontend.
 
-and writes vector tiles to:
-
-mvt_out/<dataset_name>
-
-Example:
-
-make mvt INPUT=../extras/original_datasets/highways/roads.parquet
-
-## Running the local tile server
-
-The server reads all datasets inside the datasets directory.
-You do not need to pass INPUT:
-
+## Development Server
+To preview tiles:
 make server
 
-This will:
+This:
+- Starts the Flask server
+- Opens server/view_mvt.html automatically (if supported)
 
-1. Start the Flask server with:
-
-python3 server/server.py --root datasets
-
-2. Open the viewer in your default browser:
-
-server/view_mvt.html
-
-Example tile URLs:
-
-http://localhost:5000/roads/0/0/0.mvt
-http://localhost:5000/roads/5/12/18.mvt
-
-Any dataset that exists in datasets is automatically served.
-
-## Cleaning generated data
-
-To remove all generated tiles and logs:
-
+## Cleaning Outputs
 make clean
 
-This deletes:
+Removes:
+- datasets/*
+- mvt_out/*
+- logs_*.txt
 
-datasets/*
-mvt_out/*
-logs_*.txt
-
-## Summary of commands
-
-make tiles INPUT=../path/to/data.parquet
-make mvt INPUT=../path/to/data.parquet
-make all INPUT=../path/to/data.parquet
-make server
-make clean
-
-This provides a workflow for converting any GeoJSON or GeoParquet input into tiled GeoParquet, generating histograms, producing vector tiles, and visualizing the data in a browser.
+## Summary
+✔ Required: Generate GeoParquet tiles  
+✔ Required: Generate MVT tiles  
+✔ Automatic histogram grids  
+✔ Local tile server with viewer  
+✔ Simple Makefile workflow
