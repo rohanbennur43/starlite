@@ -10,3 +10,6 @@ original_datasets/
 logs.txt
 *datasets*/
 *log*
+*results*/
+*script*/
+*.sh

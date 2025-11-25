@@ -230,6 +230,13 @@ class RSGroveAssigner:
                             eps: float = 1e-9) -> bool:
         xmin, ymin, xmax, ymax = bbox
         return (gminx >= xmin - eps) and (gminy >= ymin - eps) and (gmaxx <= xmax + eps) and (gmaxy <= ymax + eps)
+    
+    @staticmethod
+    def _intersects(bbox: Tuple[float, float, float, float],
+                    gminx: float, gminy: float, gmaxx: float, gmaxy: float) -> bool:
+        xmin, ymin, xmax, ymax = bbox
+        return not (gmaxx < xmin or gminx > xmax or gmaxy < ymin or gminy > ymax)
+
 
     def partition_by_tile(self, tbl: pa.Table) -> Dict[str, pa.Table]:
         """
@@ -263,7 +270,7 @@ class RSGroveAssigner:
             chosen_pid = None
             chosen_area = float("inf")
             for pid, xmin, ymin, xmax, ymax in self._boxes:
-                if self._contains_inclusive((xmin, ymin, xmax, ymax), gminx, gminy, gmaxx, gmaxy):
+                if self._intersects((xmin, ymin, xmax, ymax), gminx, gminy, gmaxx, gmaxy):
                     area = self._areas[pid]
                     if area < chosen_area:
                         chosen_area = area

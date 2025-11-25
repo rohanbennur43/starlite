@@ -1,4 +1,4 @@
-from shapely import ops
+from shapely import make_valid, ops
 from shapely.geometry import mapping
 import mapbox_vector_tile
 
@@ -9,7 +9,11 @@ class MVTEncoder:
         self.extent = extent
 
     def clip_to_tile(self, gdf):
+        gdf = gdf.copy()
+        gdf["geometry"] = gdf.geometry.apply(make_valid)
+        gdf = gdf[~gdf.geometry.is_empty]
         return gdf.clip(self.tile_poly_3857)
+
 
     def transform_geom(self, geom, scale_func):
         return ops.transform(scale_func, geom)

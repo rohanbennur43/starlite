@@ -14,6 +14,7 @@ PYTHON = python3
 # ----------------------------
 
 INPUT ?= none
+THRESHOLD ?= 0.5
 
 ifneq ($(MAKECMDGOALS),server)
 ifneq ($(MAKECMDGOALS),clean)
@@ -40,17 +41,19 @@ tiles:
 	$(PYTHON) -m tile_geoparquet.cli \
 		--input $(INPUT) \
 		--outdir $(TILES) \
-		--num-tiles 10 \
+		--num-tiles 40 \
 		--sort-mode zorder \
-		--sample-ratio 0.1 \
-		> $(LOGFILE) 2>&1
+		--sample-cap 10000 > $(LOGFILE) 2>&1
 	
-	$(PYTHON) mvt/mvt.py \
-		--dir $(TILES)
+# 	$(PYTHON) mvt/mvt.py \
+# 		--dir $(TILES) \
+# 		--threshold $(THRESHOLD)
 
 mvt:
 	$(PYTHON) mvt/mvt.py \
-		--dir $(TILES)
+		--dir $(TILES) \
+		--threshold $(THRESHOLD) > $(LOGFILE) 2>&1 \
+		|| (echo "MVT generation failed. Check $(LOGFILE) for details."; exit 1)
 
 # ----------------------------
 # Server target (no INPUT)

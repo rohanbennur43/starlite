@@ -43,7 +43,10 @@ const map = new maplibregl.Map({
       },
       local: {
         type: "vector",
-        tiles: ["http://127.0.0.1:5000/roads/{z}/{x}/{y}.mvt"],
+        tiles: ["http://127.0.0.1:5000/TIGER2018_COUNTY/{z}/{x}/{y}.mvt"],
+        // tiles: ["http://127.0.0.1:5000/TIGER2018_PLACE/{z}/{x}/{y}.mvt"],
+        // tiles: ["http://127.0.0.1:5000/roads/{z}/{x}/{y}.mvt"],
+
         minzoom: 0,
         maxzoom: 14
       }
@@ -54,16 +57,16 @@ const map = new maplibregl.Map({
         type: "raster",
         source: "basemap"
       },
-      {
-        id: "layer0-fill",
-        type: "fill",
-        source: "local",
-        "source-layer": "layer0",
-        paint: {
-          "fill-color": "#0080ff",
-          "fill-opacity": 0.25
-        }
-      },
+      // {
+      //   id: "layer0-fill",
+      //   type: "fill",
+      //   source: "local",
+      //   "source-layer": "layer0",
+      //   paint: {
+      //     "fill-color": "#0080ff",
+      //     "fill-opacity": 0.25
+      //   }
+      // },
       {
         id: "layer0-outline",
         type: "line",
