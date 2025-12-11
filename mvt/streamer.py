@@ -22,35 +22,32 @@ class GeometryStreamer:
         self.parquet_dir = Path(parquet_dir)
         self.to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 
-    def _decode_table(self, table: pa.Table):
-        """
-        Convert Arrow WKB geometry column to shapely geometries, reproject to EPSG 3857,
-        and yield geometry objects one by one.
-        """
-        if "geometry" not in table.column_names:
-            raise ValueError("Expected GeoParquet with a 'geometry' column")
+    def _decode_table(self, table):
+        geom_col = table["geometry"].to_pylist()
 
-        geom_col = table["geometry"]
+        # Extract all columns except geometry
+        attrs = {
+            col: table[col].to_pylist()
+            for col in table.column_names
+            if col != "geometry"
+        }
 
-        for wkb in geom_col.to_pylist():
+        for i, wkb in enumerate(geom_col):
             if wkb is None:
                 continue
 
-            try:
-                geom = swkb.loads(wkb)
-            except Exception as e:
-                logger.warning("Invalid WKB geometry skipped: %s", e)
-                continue
-
+            geom = swkb.loads(wkb)
             geom = make_valid(geom)
-
-            # reproject from EPSG 4326 to WebMercator 3857
             geom = shapely_transform(self.to_3857.transform, geom)
 
             if geom.is_empty:
                 continue
 
-            yield geom
+            # Build attribute dict {column_name: value}
+            row_attrs = {k: attrs[k][i] for k in attrs}
+
+            yield geom, row_attrs
+
 
     def iter_geometries(self):
         """

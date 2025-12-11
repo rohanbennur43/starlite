@@ -15,6 +15,7 @@ PYTHON = python3
 
 INPUT ?= none
 THRESHOLD ?= 100000
+ZOOM ?= 7
 
 ifneq ($(MAKECMDGOALS),server)
 ifneq ($(MAKECMDGOALS),clean)

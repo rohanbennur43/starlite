@@ -43,7 +43,7 @@ class TileAssigner:
                         self.nonempty[z].add((x, y))
             logger.debug(f"Zoom {z}: {len(self.nonempty[z])} nonempty tiles")
 
-    def assign_geometry(self, geom):
+    def assign_geometry(self, geom, attrs):
         logger.debug(f"Assigning geometry with bounds {geom.bounds}")
         minx, miny, maxx, maxy = geom.bounds
 
@@ -54,7 +54,7 @@ class TileAssigner:
                 for y in range(ty0, ty1 + 1):
                     if (x, y) in self.nonempty[z]:
                         # self.buckets[z][(x, y)].append(geom)
-                        self._reservoir_insert(z, x, y, geom)
+                        self._reservoir_insert(z, x, y, (geom, attrs))
                         assigned += 1
             if assigned > 0:
                 logger.debug(f"Assigned geometry to {assigned} tiles at zoom {z}")

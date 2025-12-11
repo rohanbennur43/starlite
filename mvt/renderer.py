@@ -18,8 +18,10 @@ class TileRenderer:
     def render(self, buckets):
         logger.info(f"Starting tile rendering for {len(buckets)} zoom levels")
         total = 0
+
         for z, tiles in buckets.items():
             logger.info(f"Rendering zoom {z}: {len(tiles)} tiles")
+
             for (x, y), geoms in tiles.items():
                 tb = mercator_tile_bounds(z, x, y)
 
@@ -34,40 +36,46 @@ class TileRenderer:
                 simplify_tol = (tb[2] - tb[0]) * 0.0005
                 features = []
 
-                for g in geoms:
+                for (g, attrs) in geoms:
                     g2 = g.simplify(simplify_tol, preserve_topology=True)
                     if g2.is_empty:
                         continue
-                    
                     g2 = make_valid(g2)
 
                     try:
                         clipped = g2.intersection(padded)
                     except Exception as e:
-                        logger.error(f"Error clipping geometry: {e}")
+                        logger.error(f"Error clipping geometry at z={z}, x={x}, y={y}: {e}")
                         g2 = g2.buffer(0)
                         clipped = g2.intersection(padded)
 
                     if clipped.is_empty:
                         continue
-                    
+
                     clipped = make_valid(clipped)
+                    properties = {k: v for k, v in attrs.items() if v is not None}
                     for part in explode_geom(clipped):
                         transformed = transform(to_tile, part)
-                        features.append({"geometry": mapping(transformed), "properties": {}})
+                        features.append({
+                            "geometry": mapping(transformed),
+                            "properties": properties
+                        })
 
                 if not features:
                     logger.debug(f"No features for tile z={z} x={x} y={y}, skipping")
                     continue
 
+                # 6. encode tile
                 layer = {"name": "layer0", "features": features, "extent": EXTENT}
                 data = mapbox_vector_tile.encode([layer])
 
+                # 7. write file
                 tile_path = self.outdir / str(z) / str(x)
                 tile_path.mkdir(parents=True, exist_ok=True)
+
                 with open(tile_path / f"{y}.mvt", "wb") as f:
                     f.write(data)
-                    logger.debug(f"Wrote tile z={z} x={x} y={y} with {len(features)} features")
                     total += 1
+                    logger.debug(f"Wrote tile z={z} x={x} y={y} with {len(features)} features")
 
         logger.info(f"Rendering complete. Wrote {total} MVT tiles to {self.outdir}")

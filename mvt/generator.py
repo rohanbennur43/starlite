@@ -31,8 +31,8 @@ class BucketMVTGenerator:
         logger.info(f"Streaming geometries from {self.parquet_dir}")
         geom_count = 0
         streamer = GeometryStreamer(self.parquet_dir)
-        for geom in streamer.iter_geometries():
-            assigner.assign_geometry(geom)
+        for geom, attrs in streamer.iter_geometries():
+            assigner.assign_geometry(geom, attrs)
             geom_count += 1
             if geom_count % 10000 == 0:
                 logger.debug(f"Processed {geom_count} geometries")
