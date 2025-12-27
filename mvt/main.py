@@ -1,5 +1,6 @@
 import argparse
 import logging
+from time import perf_counter
 from mvt.generator import BucketMVTGenerator
 
 logger = logging.getLogger(__name__)
@@ -24,5 +25,7 @@ if __name__ == "__main__":
         last_zoom=args.zoom,
         threshold=args.threshold
     )
+    tiles_start = perf_counter()
     gen.run()
-    logger.info("MVT generation completed successfully")
+    tiles_end = perf_counter()
+    logger.info("MVT generation completed successfully in %.2f seconds", tiles_end - tiles_start)

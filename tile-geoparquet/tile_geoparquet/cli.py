@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import logging
+from time import perf_counter
 
 from .datasource import GeoParquetSource, GeoJSONSource, is_geojson_path
 from .assigner import TileAssignerFromCSV, RSGroveAssigner
@@ -102,7 +103,9 @@ def main():
             sample_ratio=args.sample_ratio,
             sample_cap=args.sample_cap,
         )
+        logger.info("RSGrove partitioner ready; proceeding to tiling.")
 
+    partition_run_start = perf_counter()
     orchestrator = RoundOrchestrator(
         source=source,
         assigner=assigner,
@@ -114,10 +117,16 @@ def main():
         sfc_bits=args.sfc_bits,
     )
     orchestrator.run()
+    partition_run_end = perf_counter()
+    logger.info(
+        "Partitioning and GeoParquet tile writing completed in %.2f seconds.",
+        partition_run_end - partition_run_start,
+    )
 
 
     logger.info("Tiling complete. Starting histogram generation.")
 
+    histogram_start = perf_counter()
     build_histograms_for_dir(
         tiles_dir=args.outdir + "/parquet_tiles",
         outdir=args.outdir + "/histograms",
@@ -127,6 +136,8 @@ def main():
         hist_max_parallel=8,
         hist_rg_parallel=4,
     )
+    histogram_end = perf_counter()
+    logger.info("Histogram computation completed in %.2f seconds.", histogram_end - histogram_start)
 
 if __name__ == "__main__":
     main()
