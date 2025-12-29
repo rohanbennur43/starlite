@@ -139,9 +139,21 @@ class AbstractHistogram(Protocol):
 # ----------------------------- R*-like splitter -------------------------------
 
 def _bbox_from_indices(coords: np.ndarray, idx: np.ndarray) -> EnvelopeNDLite:
-    # coords (D, N); idx (K,)
-    mins = np.min(coords[:, idx], axis=1)
-    maxs = np.max(coords[:, idx], axis=1)
+    # Backward compatibility shim: dispatch to slice-based computation.
+    # Expects idx to be a contiguous slice of positions.
+    if idx.ndim != 1:
+        raise ValueError("idx must be 1-D")
+    start = int(idx[0])
+    end = int(idx[-1]) + 1
+    mins = np.min(coords[:, start:end], axis=1)
+    maxs = np.max(coords[:, start:end], axis=1)
+    return EnvelopeNDLite(mins, maxs)
+
+
+def _bbox_from_slice(coords: np.ndarray, start: int, end: int) -> EnvelopeNDLite:
+    # coords (D, N); slice over columns [start:end)
+    mins = np.min(coords[:, start:end], axis=1)
+    maxs = np.max(coords[:, start:end], axis=1)
     return EnvelopeNDLite(mins, maxs)
 
 
@@ -153,7 +165,6 @@ def _overlap_volume(a: EnvelopeNDLite, b: EnvelopeNDLite) -> float:
 
 
 def _choose_split(coords: np.ndarray,
-                  idx: np.ndarray,
                   start: int,
                   end: int,
                   w: Optional[np.ndarray],
@@ -161,8 +172,8 @@ def _choose_split(coords: np.ndarray,
                   M: float,
                   fraction_min_split: float) -> int:
     """
-    R*-style split selection on the given subset (indices idx).
-    Sorts the target slice of idx in-place by the chosen axis and returns the
+    R*-style split selection on the given subset (columns in coords).
+    Sorts the target slice of coords (and weights) in-place by the chosen axis and returns the
     split position within that slice.
     - Examine each axis
     - For each axis, sort by coordinate, consider candidate split positions
@@ -176,26 +187,143 @@ def _choose_split(coords: np.ndarray,
     n = end - start
     assert n >= 2, "Need at least 2 points to split"
 
-    subset = idx[start:end]
+    has_weights = w is not None
+    sorted_axis: Optional[int] = None  # track last axis we sorted by to avoid rescanning
+
+    def _quicksort_inplace(axis: int):
+        """Sort coords[:, start:end] (and weights) in-place using quicksort on coords[axis]."""
+        nonlocal sorted_axis
+        if n <= 1 or sorted_axis == axis:
+            return
+        coord_axis = coords[axis]
+        stack: List[Tuple[int, int]] = [(0, n - 1)]
+
+        def _median_of_three_pos(lo: int, hi: int) -> int:
+            mid = (lo + hi) // 2
+            a_val = coord_axis[start + lo]
+            b_val = coord_axis[start + mid]
+            c_val = coord_axis[start + hi]
+            if (a_val <= b_val <= c_val) or (c_val <= b_val <= a_val):
+                return mid
+            if (b_val <= a_val <= c_val) or (c_val <= a_val <= b_val):
+                return lo
+            return hi
+
+        def _swap(i_pos: int, j_pos: int):
+            if i_pos == j_pos:
+                return
+            a, b = start + i_pos, start + j_pos
+            coords[:, [a, b]] = coords[:, [b, a]]
+            if has_weights:
+                w[a], w[b] = w[b], w[a]
+
+        while stack:
+            lo, hi = stack.pop()
+            while lo < hi:
+                i, j = lo, hi
+                pivot_pos = _median_of_three_pos(lo, hi)
+                pivot_idx = start + pivot_pos
+                pivot = coord_axis[pivot_idx]
+                while i <= j:
+                    while True:
+                        cur_idx = start + i
+                        cur_val = coord_axis[cur_idx]
+                        if (cur_val < pivot) or (cur_val == pivot and cur_idx < pivot_idx):
+                            i += 1
+                            continue
+                        break
+                    while True:
+                        cur_idx = start + j
+                        cur_val = coord_axis[cur_idx]
+                        if (cur_val > pivot) or (cur_val == pivot and cur_idx > pivot_idx):
+                            j -= 1
+                            continue
+                        break
+                    if i <= j:
+                        _swap(i, j)
+                        i += 1
+                        j -= 1
+                if (j - lo) < (hi - i):
+                    if i < hi:
+                        stack.append((i, hi))
+                    hi = j
+                else:
+                    if lo < j:
+                        stack.append((lo, j))
+                    lo = i
+        sorted_axis = axis
+
+    def _best_split_for_axis(k_candidates: List[int]) -> Tuple[Optional[Tuple[float, float, float]], Optional[int]]:
+        """
+        Compute prefix/suffix MBRs once and evaluate candidate split positions.
+        Returns (best_score, best_k) for the current axis.
+        """
+        D_local = coords.shape[0]
+        left_min = np.empty((D_local, n), dtype=float)
+        left_max = np.empty((D_local, n), dtype=float)
+        right_min = np.empty((D_local, n), dtype=float)
+        right_max = np.empty((D_local, n), dtype=float)
+
+        first_pt = coords[:, start]
+        left_min[:, 0] = first_pt
+        left_max[:, 0] = first_pt
+        for i in range(1, n):
+            pt = coords[:, start + i]
+            np.minimum(left_min[:, i - 1], pt, out=left_min[:, i])
+            np.maximum(left_max[:, i - 1], pt, out=left_max[:, i])
+
+        last_pt = coords[:, start + n - 1]
+        right_min[:, -1] = last_pt
+        right_max[:, -1] = last_pt
+        for i in range(n - 2, -1, -1):
+            pt = coords[:, start + i]
+            np.minimum(right_min[:, i + 1], pt, out=right_min[:, i])
+            np.maximum(right_max[:, i + 1], pt, out=right_max[:, i])
+
+        best_axis = None
+        best_axis_k = None
+        for k in k_candidates:
+            if k + 1 >= n:
+                continue
+            lmin = left_min[:, k]
+            lmax = left_max[:, k]
+            rmin = right_min[:, k + 1]
+            rmax = right_max[:, k + 1]
+
+            side_l = np.maximum(0.0, lmax - lmin)
+            side_r = np.maximum(0.0, rmax - rmin)
+            score_margin = float(np.sum(side_l) + np.sum(side_r))
+            overlap_side = np.maximum(0.0, np.minimum(lmax, rmax) - np.maximum(lmin, rmin))
+            score_overlap = float(np.prod(overlap_side))
+            score_area = float(np.prod(side_l) + np.prod(side_r))
+
+            cand = (score_margin, score_overlap, score_area)
+            if (best_axis is None) or (cand < best_axis):
+                best_axis = cand
+                best_axis_k = k + 1  # split position (exclusive)
+
+        return best_axis, best_axis_k
     # Candidate split positions must leave >= m on each side (in weight terms).
     if w is None:
         total_w = float(n)
     else:
-        total_w = float(np.sum(w[subset]))
-    min_side_w = float(m) if w is None else float(m)  # already weight for weighted mode
+        total_w = float(np.sum(w[start:end]))
+    min_side_w = float(m)
     # Boundaries in index space: we'll use cumulative weights to honor m and M
     # Build a helper over a sorted order per axis, so thresholds translate via prefix sums.
 
-    best = None  # (score_margin, score_overlap, score_area, axis, k_split, order)
-    best_order = None
+    best = None  # (score_margin, score_overlap, score_area)
+    best_axis_id = None
     best_k = None
 
     for axis in range(D):
-        order_list = sorted(subset.tolist(), key=lambda i: coords[axis, i])
-        order = np.fromiter(order_list, dtype=idx.dtype, count=n)
-        w_sorted = np.ones(n, dtype=float) if w is None else w[order].astype(float, copy=False)
+        _quicksort_inplace(axis)
+        left_min, left_max, right_min, right_max = _compute_bounds()
 
-        prefix = np.cumsum(w_sorted)  # cum weights
+        if has_weights:
+            prefix = np.cumsum(w[start:end]).astype(float, copy=False)  # cum weights
+        else:
+            prefix = np.arange(1, n + 1, dtype=float)
         # valid split positions are between elements: at k means left=[0:k], right=[k:n]
         # require both sides >= min_side_w
         left_ok = prefix >= min_side_w
@@ -215,48 +343,31 @@ def _choose_split(coords: np.ndarray,
                 if hi <= lo:  # ensure at least one candidate
                     lo = 0; hi = len(k_valid)
                 k_valid = k_valid[lo:hi]
-            k_candidates = k_valid.tolist()
+        k_candidates = k_valid.tolist()
 
         # Evaluate candidates on R*-criteria
-        best_axis = None
-        for k in k_candidates:
-            left_ids = order[:k+1]   # include element k on the left
-            right_ids = order[k+1:]
-            if left_ids.size == 0 or right_ids.size == 0:
-                continue
-
-            mbr_l = _bbox_from_indices(coords, left_ids)
-            mbr_r = _bbox_from_indices(coords, right_ids)
-
-            score_margin = mbr_l.margin() + mbr_r.margin()
-            score_overlap = _overlap_volume(mbr_l, mbr_r)
-            score_area = mbr_l.area() + mbr_r.area()
-
-            cand = (score_margin, score_overlap, score_area)
-            if (best_axis is None) or (cand < best_axis):
-                best_axis = cand
-                best_axis_k = k + 1  # split position (exclusive)
+        best_axis, best_axis_k = _best_split_for_axis(k_candidates)
 
         if best_axis is None:
             continue
 
-        if (best is None) or (best_axis < best[:3]):
-            best = (*best_axis, axis)
-            best_order = order
+        if (best is None) or (best_axis < best):
+            best = best_axis
+            best_axis_id = axis
             best_k = best_axis_k
 
-    if best_order is None or best_k is None:
-        order_list = sorted(subset.tolist(), key=lambda i: coords[0, i])
-        best_order = np.fromiter(order_list, dtype=idx.dtype, count=n)
+    if best_axis_id is None or best_k is None:
+        _quicksort_inplace(0)
+        best_axis_id = 0
         best_k = n // 2
 
-    idx[start:end] = best_order
+    # Ensure the slice is sorted by the chosen axis before returning split position.
+    _quicksort_inplace(best_axis_id)
     split_at = start + best_k
     return split_at
 
 
 def _rstar_partition_iterative(coords: np.ndarray,
-                               idx: np.ndarray,
                                w: Optional[np.ndarray],
                                min_cap: float,
                                max_cap: float,
@@ -268,7 +379,7 @@ def _rstar_partition_iterative(coords: np.ndarray,
     """
     import logging
     logger = logging.getLogger("RSGrovePartitioner._rstar_partition_iterative")
-    stack: List[Tuple[int, int]] = [(0, idx.size)]
+    stack: List[Tuple[int, int]] = [(0, coords.shape[1])]
 
     while stack:
         start, end = stack.pop()
@@ -280,15 +391,15 @@ def _rstar_partition_iterative(coords: np.ndarray,
         if w is None:
             cap_here = float(subset_size)
         else:
-            cap_here = float(np.sum(w[idx[start:end]]))
+            cap_here = float(np.sum(w[start:end]))
 
         logger.debug(f"Subset start={start}, end={end}: cap_here={cap_here}, max_cap={max_cap}")
         if cap_here <= max_cap:
             logger.debug(f"Subset start={start}, end={end}: within capacity, creating box.")
-            out_boxes.append(_bbox_from_indices(coords, idx[start:end]))
+            out_boxes.append(_bbox_from_slice(coords, start, end))
             continue
 
-        split_at = _choose_split(coords, idx, start, end, w, min_cap, max_cap, fraction_min_split)
+        split_at = _choose_split(coords, start, end, w, min_cap, max_cap, fraction_min_split)
         logger.debug(f"Subset start={start}, end={end}: split_at={split_at}")
 
         if split_at <= start or split_at >= end:
@@ -319,9 +430,8 @@ def partition_weighted_points(coords: np.ndarray,
                               fraction_min_split: float) -> List[EnvelopeNDLite]:
     """Weighted partitioning (capacities based on data sizes)."""
     _, N = coords.shape
-    idx = np.arange(N, dtype=np.int64)
     boxes: List[EnvelopeNDLite] = []
-    _rstar_partition_iterative(coords, idx, weights.astype(float), float(min_cap_w), float(max_cap_w),
+    _rstar_partition_iterative(coords, weights.astype(float), float(min_cap_w), float(max_cap_w),
                                fraction_min_split, boxes)
     if expand_to_inf and boxes:
         boxes = _expand_to_infinity(boxes)
