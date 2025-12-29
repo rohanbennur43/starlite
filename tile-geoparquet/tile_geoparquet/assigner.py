@@ -91,6 +91,7 @@ class RSGroveAssigner:
         self._geom_col = geom_col
         self._boxes = boxes or []  # list of (pid, minx, miny, maxx, maxy)
         self._areas = {pid: (xmax - xmin) * (ymax - ymin) for pid, xmin, ymin, xmax, ymax in self._boxes}
+        self._smallest_area_pid = min(self._areas, key=self._areas.get) if self._areas else None
         logger.info("RSGroveAssigner ready with %d partitions", self._part.numPartitions())
 
     @property
@@ -251,12 +252,26 @@ class RSGroveAssigner:
         xmin, ymin, xmax, ymax = bbox
         return not (gmaxx < xmin or gminx > xmax or gmaxy < ymin or gminy > ymax)
 
+    @staticmethod
+    def _expansion_area(bbox: Tuple[float, float, float, float],
+                        gminx: float, gminy: float, gmaxx: float, gmaxy: float) -> float:
+        xmin, ymin, xmax, ymax = bbox
+        new_xmin = min(xmin, gminx)
+        new_ymin = min(ymin, gminy)
+        new_xmax = max(xmax, gmaxx)
+        new_ymax = max(ymax, gmaxy)
+        new_area = (new_xmax - new_xmin) * (new_ymax - new_ymin)
+        old_area = (xmax - xmin) * (ymax - ymin)
+        return new_area - old_area
+
 
     def partition_by_tile(self, tbl: pa.Table) -> Dict[str, pa.Table]:
         """
-        CONTAINS-ONLY assignment:
-          - Assign a row to the smallest-area tile whose MBR fully contains the row's bbox.
-          - If none contains, the row is SKIPPED.
+        Center-first assignment with fallback expansion minimization:
+          - Assign a row to the first partition whose MBR contains the row's centroid.
+          - If none contains the centroid, assign to the partition that requires the
+            least MBR expansion to encompass the row's bbox.
+          - Records are never skipped.
         """
         logger.info("[ASSIGNER] After ensure_large_types metadata: %s", tbl.schema.metadata)
 
@@ -273,34 +288,44 @@ class RSGroveAssigner:
 
         row_ids_by_pid: Dict[int, List[int]] = {}
         assigned = 0
-        skipped = 0
 
         for i, g in enumerate(geoms):
+            # Degenerate/empty geometries fall back to the smallest partition by area.
             if g is None or g.is_empty:
-                skipped += 1
+                fallback_pid = self._smallest_area_pid
+                if fallback_pid is not None:
+                    row_ids_by_pid.setdefault(int(fallback_pid), []).append(i)
+                    assigned += 1
                 continue
-            gminx, gminy, gmaxx, gmaxy = g.bounds
 
-            chosen_pid = None
-            chosen_area = float("inf")
+            gminx, gminy, gmaxx, gmaxy = g.bounds
+            cx, cy = g.centroid.x, g.centroid.y
+
+            # First pass: find the first partition whose MBR contains the centroid.
+            chosen_pid: Optional[int] = None
             for pid, xmin, ymin, xmax, ymax in self._boxes:
-                if self._intersects((xmin, ymin, xmax, ymax), gminx, gminy, gmaxx, gmaxy):
-                    area = self._areas[pid]
-                    if area < chosen_area:
-                        chosen_area = area
+                if self._contains_inclusive((xmin, ymin, xmax, ymax), cx, cy, cx, cy):
+                    chosen_pid = pid
+                    break
+
+            # Fallback: choose the partition that minimally expands to include the geometry bbox.
+            if chosen_pid is None:
+                chosen_pid = None
+                chosen_expansion = float("inf")
+                for pid, xmin, ymin, xmax, ymax in self._boxes:
+                    expansion = self._expansion_area((xmin, ymin, xmax, ymax), gminx, gminy, gmaxx, gmaxy)
+                    if expansion < chosen_expansion:
+                        chosen_expansion = expansion
                         chosen_pid = pid
 
-            if chosen_pid is None:
-                skipped += 1
-                continue
-
-            row_ids_by_pid.setdefault(int(chosen_pid), []).append(i)
-            assigned += 1
+            if chosen_pid is not None:
+                row_ids_by_pid.setdefault(int(chosen_pid), []).append(i)
+                assigned += 1
 
         out: Dict[str, pa.Table] = {}
         for pid, idxs in row_ids_by_pid.items():
             out[f"tile_{pid:06d}"] = t.take(pa.array(idxs, type=pa.int32()))
 
-        logger.info("partition_by_tile (contains-only): input_rows=%d, assigned=%d, skipped=%d, tiles=%d",
-                    t.num_rows, assigned, skipped, len(out))
+        logger.info("partition_by_tile (center-first): input_rows=%d, assigned=%d, tiles=%d",
+                    t.num_rows, assigned, len(out))
         return out
