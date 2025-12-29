@@ -92,6 +92,8 @@ class RSGroveAssigner:
         self._boxes = boxes or []  # list of (pid, minx, miny, maxx, maxy)
         self._areas = {pid: (xmax - xmin) * (ymax - ymin) for pid, xmin, ymin, xmax, ymax in self._boxes}
         self._smallest_area_pid = min(self._areas, key=self._areas.get) if self._areas else None
+        # Pre-sort partitions by xmin for plane-sweep filtering.
+        self._boxes_by_xmin = sorted(self._boxes, key=lambda b: b[1])
         logger.info("RSGroveAssigner ready with %d partitions", self._part.numPartitions())
 
     @property
@@ -289,6 +291,8 @@ class RSGroveAssigner:
         row_ids_by_pid: Dict[int, List[int]] = {}
         assigned = 0
 
+        # Pre-compute geometry envelopes/centroids and sort by minx for plane sweep.
+        geom_info: List[Tuple[float, int, float, float, float, float, float]] = []  # (minx, idx, miny, maxx, maxy, cx, cy)
         for i, g in enumerate(geoms):
             # Degenerate/empty geometries fall back to the smallest partition by area.
             if g is None or g.is_empty:
@@ -300,19 +304,37 @@ class RSGroveAssigner:
 
             gminx, gminy, gmaxx, gmaxy = g.bounds
             cx, cy = g.centroid.x, g.centroid.y
+            geom_info.append((gminx, i, gminy, gmaxx, gmaxy, cx, cy))
 
-            # First pass: find the first partition whose MBR contains the centroid.
+        geom_info.sort(key=lambda x: x[0])
+
+        active_partitions: List[Tuple[int, float, float, float, float]] = []
+        p_idx = 0
+        n_parts = len(self._boxes_by_xmin)
+
+        for gminx, i, gminy, gmaxx, gmaxy, cx, cy in geom_info:
+            # Add partitions whose xmin is now in sweep range (xmin <= gmaxx).
+            while p_idx < n_parts and self._boxes_by_xmin[p_idx][1] <= gmaxx:
+                active_partitions.append(self._boxes_by_xmin[p_idx])
+                p_idx += 1
+
+            # Drop partitions that are left of the current geometry (xmax < gminx).
+            if active_partitions:
+                active_partitions = [p for p in active_partitions if p[3] >= gminx]
+
             chosen_pid: Optional[int] = None
-            for pid, xmin, ymin, xmax, ymax in self._boxes:
+
+            # First pass: centroid containment among active partitions.
+            for pid, xmin, ymin, xmax, ymax in active_partitions:
                 if self._contains_inclusive((xmin, ymin, xmax, ymax), cx, cy, cx, cy):
                     chosen_pid = pid
                     break
 
-            # Fallback: choose the partition that minimally expands to include the geometry bbox.
+            # Fallback: minimal expansion among active partitions; if none, fall back to smallest partition.
             if chosen_pid is None:
-                chosen_pid = None
+                candidates = active_partitions if active_partitions else self._boxes_by_xmin
                 chosen_expansion = float("inf")
-                for pid, xmin, ymin, xmax, ymax in self._boxes:
+                for pid, xmin, ymin, xmax, ymax in candidates:
                     expansion = self._expansion_area((xmin, ymin, xmax, ymax), gminx, gminy, gmaxx, gmaxy)
                     if expansion < chosen_expansion:
                         chosen_expansion = expansion
