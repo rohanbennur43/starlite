@@ -134,19 +134,33 @@ class GeoJSONSource(DataSource):
     # ---------------- iterator ---------------- #
     def iter_tables(self) -> Iterable[pa.Table]:
         batch_index = 0
+        crs_value = self._crs_hint or self.target_crs or self.src_crs
+        import geopandas as gpd
 
         for features in _iter_geojson_feature_batches(self.path, self.batch_rows, self._use_geojsonl):
-            chunk = self._build_table_from_features(features)
-            tbl = self._finalize_chunk(chunk)
-            if tbl is not None:
-                logger.info(
-                    "GeoJSON batch %d (%d rows) -> %d columns (including 'geometry')",
-                    batch_index,
-                    tbl.num_rows,
-                    len(tbl.column_names),
-                )
-                batch_index += 1
-                yield tbl
+            if not features:
+                continue
+            gdf = gpd.GeoDataFrame.from_features(features, crs=crs_value)
+            geometry_col = pa.array(gdf.geometry.to_wkb(), type=pa.binary())
+            props_df = gdf.drop(columns="geometry")
+            props_table = pa.Table.from_pandas(props_df, preserve_index=False)
+            table = (
+                pa.table([geometry_col], names=["geometry"])
+                if props_table.num_columns == 0
+                else props_table.append_column("geometry", geometry_col)
+            )
+            # Attach GeoParquet metadata with CRS
+            schema_with_geo = _attach_geoparquet_metadata(table.schema, crs_value)
+            table = table.replace_schema_metadata(schema_with_geo.metadata)
+            self._schema = schema_with_geo
+            logger.info(
+                "GeoJSON batch %d (%d rows) -> %d columns (including 'geometry')",
+                batch_index,
+                table.num_rows,
+                len(table.column_names),
+            )
+            batch_index += 1
+            yield table
 
     # ---------------- internal helpers ---------------- #
     def _read_first_batch(self) -> Optional[pa.Table]:
