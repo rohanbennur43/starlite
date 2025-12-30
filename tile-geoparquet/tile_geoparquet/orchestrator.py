@@ -148,6 +148,29 @@ class RoundOrchestrator:
             out[f"tile_{tid:06d}"] = batch.take(pa.array(idxs, type=pa.int32()))
         return out
 
+    def _group_by_partition_ids(self, batch: pa.Table, partitions: pa.Table) -> Dict[str, pa.Table]:
+        """Group a batch using the partition_id table returned by the assigner."""
+        if partitions.num_rows != batch.num_rows:
+            raise ValueError("Partition table must align with batch row count")
+        if "partition_id" not in partitions.column_names:
+            raise ValueError("Partition table missing 'partition_id' column")
+
+        arr = partitions["partition_id"].to_numpy(zero_copy_only=False)
+        groups: Dict[int, List[int]] = {}
+        for i, v in enumerate(arr):
+            if v is None:
+                continue
+            try:
+                pid = int(v)
+            except Exception:
+                continue
+            groups.setdefault(pid, []).append(i)
+
+        out: Dict[str, pa.Table] = {}
+        for pid, idxs in groups.items():
+            out[f"tile_{pid:06d}"] = batch.take(pa.array(idxs, type=pa.int32()))
+        return out
+
     # ------------------------------------------------------------------
 
     def _run_one_round(self, ds: DataSource, round_id: int) -> Optional[Path]:
@@ -181,7 +204,8 @@ class RoundOrchestrator:
                 logger.debug("Round %d: batch %d → reused cached tile IDs (%d tiles)",
                              round_id, batch_idx, len(parts))
             else:
-                parts = self.assigner.partition_by_tile(batch)
+                partition_table = self.assigner.partition_by_tile(batch)
+                parts = self._group_by_partition_ids(batch, partition_table)
                 logger.debug("Round %d: batch %d → assigned fresh (%d tiles)",
                              round_id, batch_idx, len(parts))
 
