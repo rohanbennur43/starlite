@@ -152,7 +152,9 @@ class GeoJSONSource(DataSource):
             # Attach GeoParquet metadata with CRS
             schema_with_geo = _attach_geoparquet_metadata(table.schema, crs_value)
             table = table.replace_schema_metadata(schema_with_geo.metadata)
-            self._schema = schema_with_geo
+            if not self._schema:
+                self._schema = schema_with_geo
+            table = self._coerce_to_schema(table, self.schema()).combine_chunks()
             logger.info(
                 "GeoJSON batch %d (%d rows) -> %d columns (including 'geometry')",
                 batch_index,
@@ -221,6 +223,8 @@ class GeoJSONSource(DataSource):
         return tbl.replace_schema_metadata(self._schema.metadata)
 
     def _coerce_to_schema(self, t: pa.Table, schema: pa.Schema) -> pa.Table:
+        if (t.schema.equals(schema)):
+            return t
         out_cols = []
         for fld in schema:
             name = fld.name

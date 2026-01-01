@@ -367,8 +367,8 @@ class WriterPool:
     # --------------------------- Public API ---------------------------
 
     def append(self, tile_id: str, table: pa.Table) -> None:
-        logger.info("\n--- DEBUG: WriterPool.append ---")
-        logger.info("Incoming metadata: %s", table.schema.metadata)
+        logger.debug("\n--- DEBUG: WriterPool.append ---")
+        logger.debug("Incoming metadata: %s", table.schema.metadata)
 
         if table is None or table.num_rows == 0:
             return
