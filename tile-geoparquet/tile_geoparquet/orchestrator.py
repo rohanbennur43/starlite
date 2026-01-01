@@ -115,6 +115,7 @@ class RoundOrchestrator:
         sort_mode: str = "zorder",
         sort_keys: Optional[str] = None,
         sfc_bits: int = 16,
+        records_per_round: int = 100_000,
     ):
         self.source = source
         self.assigner = assigner
@@ -126,6 +127,7 @@ class RoundOrchestrator:
         self.sort_keys = sort_keys
         self.sfc_bits = int(sfc_bits)
         self.src_schema: pa.Schema = source.schema()
+        self.records_per_round = int(records_per_round)
 
     # ------------------------------------------------------------------
 
@@ -173,7 +175,12 @@ class RoundOrchestrator:
 
     # ------------------------------------------------------------------
 
-    def _run_one_round(self, ds: DataSource, round_id: int) -> Optional[Path]:
+    def _run_one_round(
+        self,
+        ds: DataSource,
+        round_id: int,
+        records_per_round: Optional[int] = None,
+    ) -> Optional[Path]:
         logger.info("Starting round %d", round_id)
         Path(self.outdir).mkdir(parents=True, exist_ok=True)
 
@@ -196,18 +203,35 @@ class RoundOrchestrator:
 
         open_tiles: Set[str] = set()
         cap = max(1, self.max_parallel_files - 1)
+        batches: List[pa.Table] = []
+        current_rows = 0
+        records_limit = max(1, int(records_per_round or self.records_per_round))
 
-        for batch_idx, batch in enumerate(ds.iter_tables()):
+        def process_accumulated(batch_id: int) -> None:
+            nonlocal batches, current_rows
+            if not batches:
+                return
+
+            combined = pa.concat_tables(batches, promote=True).combine_chunks()
+
             # Check for persistent tile ID column
-            if _TILE_COL in batch.column_names:
-                parts = self._group_by_tile_column(batch)
-                logger.debug("Round %d: batch %d → reused cached tile IDs (%d tiles)",
-                             round_id, batch_idx, len(parts))
+            if _TILE_COL in combined.column_names:
+                parts = self._group_by_tile_column(combined)
+                logger.debug(
+                    "Round %d: batches up to %d → reused cached tile IDs (%d tiles)",
+                    round_id,
+                    batch_id,
+                    len(parts),
+                )
             else:
-                partition_table = self.assigner.partition_by_tile(batch)
-                parts = self._group_by_partition_ids(batch, partition_table)
-                logger.debug("Round %d: batch %d → assigned fresh (%d tiles)",
-                             round_id, batch_idx, len(parts))
+                partition_table = self.assigner.partition_by_tile(combined)
+                parts = self._group_by_partition_ids(combined, partition_table)
+                logger.debug(
+                    "Round %d: batches up to %d → assigned fresh (%d tiles)",
+                    round_id,
+                    batch_id,
+                    len(parts),
+                )
 
             for tile_id, sub in parts.items():
                 if tile_id in open_tiles or len(open_tiles) < cap:
@@ -217,6 +241,18 @@ class RoundOrchestrator:
                     pool.append(tile_id, sub)
                 else:
                     ow.write_batch(sub, tile_id=tile_id)
+
+            batches = []
+            current_rows = 0
+
+        batch_idx = -1
+        for batch_idx, batch in enumerate(ds.iter_tables()):
+            batches.append(batch)
+            current_rows += batch.num_rows
+            if current_rows >= records_limit:
+                process_accumulated(batch_idx)
+
+        process_accumulated(batch_idx)
 
         # Flush and handle overflow
         if open_tiles:
@@ -251,7 +287,7 @@ class RoundOrchestrator:
         ds: DataSource = self.source
 
         while True:
-            overflow_path = self._run_one_round(ds, round_id)
+            overflow_path = self._run_one_round(ds, round_id, records_per_round=self.records_per_round)
             if overflow_path is None:
                 break
 
