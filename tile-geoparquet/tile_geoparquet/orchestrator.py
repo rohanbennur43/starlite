@@ -115,7 +115,7 @@ class RoundOrchestrator:
         sort_mode: str = "zorder",
         sort_keys: Optional[str] = None,
         sfc_bits: int = 16,
-        records_per_round: int = 100_000,
+        records_per_round: int = 1000_000,
     ):
         self.source = source
         self.assigner = assigner

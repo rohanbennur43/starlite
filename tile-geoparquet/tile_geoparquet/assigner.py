@@ -4,6 +4,7 @@ import logging
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+from time import perf_counter
 
 from shapely import from_wkb
 from .RSGrove import RSGrovePartitioner, BeastOptions, EnvelopeNDLite
@@ -262,6 +263,7 @@ class RSGroveAssigner:
           - Returns a table of partition IDs aligned with the input order.
         """
         logger.info("[ASSIGNER] After ensure_large_types metadata: %s", tbl.schema.metadata)
+        start_time = perf_counter()
 
         if tbl.num_rows == 0:
             return pa.table({"partition_id": pa.array([], type=pa.int32())})
@@ -339,7 +341,8 @@ class RSGroveAssigner:
             raise ValueError("Failed to assign partitions for all rows")
 
         out = pa.table({"partition_id": pa.array(partition_ids, type=pa.int32())})
+        end_time = perf_counter()
 
-        logger.info("partition_by_tile (contains-only): input_rows=%d, tiles=%d",
-                    t.num_rows, len(out))
+        logger.info("partition_by_tile (contains-only): input_rows=%d, tiles=%d, finished in %.3f seconds, with a rate of %.3f rows/second",
+                    t.num_rows, len(out), end_time - start_time, t.num_rows / (end_time - start_time) if end_time != start_time else 0)
         return out
