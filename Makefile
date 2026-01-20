@@ -69,13 +69,13 @@ mvt:
 
 server:
 	python3 server/server.py --root datasets &
-	sleep 1
+	sleep 2
 	@if command -v xdg-open >/dev/null 2>&1; then \
-		xdg-open server/view_mvt.html; \
+		xdg-open http://127.0.0.1:5000; \
 	elif command -v open >/dev/null 2>&1; then \
-		open server/view_mvt.html; \
+		open http://127.0.0.1:5000; \
 	else \
-		echo "Please open server/view_mvt.html manually"; \
+		echo "Server running at http://127.0.0.1:5000"; \
 	fi
 
 # ----------------------------

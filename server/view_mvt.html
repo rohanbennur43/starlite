@@ -2,25 +2,233 @@
 <html>
 <head>
 <meta charset="utf-8" />
-<title>ROADS Viewer</title>
+<title>MVT Viewer - Points, Lines, Polygons</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-
 <link href="https://unpkg.com/maplibre-gl@3.6.0/dist/maplibre-gl.css" rel="stylesheet" />
 <script src="https://unpkg.com/maplibre-gl@3.6.0/dist/maplibre-gl.js"></script>
-
 <style>
   body { margin: 0; padding: 0; }
   #map { width: 100vw; height: 100vh; }
 </style>
 </head>
-
 <body>
+
 <div id="map"></div>
 
 <script>
 // ---------------------------
-// Map initialization
+// Get dataset from URL parameters or environment
 // ---------------------------
+const urlParams = new URLSearchParams(window.location.search);
+let dataset = urlParams.get('dataset') || '{{ dataset }}' || 'TIGER2018_COUNTY';
+
+// Remove template brackets if no value passed from server
+if (dataset.includes('{{')) {
+  dataset = 'TIGER2018_COUNTY';
+}
+
+const tileUrl = `http://127.0.0.1:5000/${dataset}/{z}/{x}/{y}.mvt`;
+console.log(`Loading dataset: ${dataset}`);
+console.log(`Tile URL: ${tileUrl}`);
+
+// Detect dataset type
+const isPointDataset = dataset.includes('POINTLM') || dataset.includes('POINT');
+const isPolygonDataset = dataset.includes('COUNTY') || dataset.includes('PLACE');
+const isRoadsDataset = dataset.includes('ROAD') || dataset.includes('RAIL') || dataset.includes('PRISEC');
+
+// Intercept fetch to log tile loading
+const origFetch = window.fetch;
+window.fetch = async function(...args) {
+  console.log("[Fetch] Request", args[0]);
+  try {
+    const resp = await origFetch(...args);
+    console.log("[Fetch] Response", args[0], resp.status, resp.headers.get("Content-Type"));
+    return resp;
+  } catch (err) {
+    console.error("[Fetch] ERROR", args[0], err);
+    throw err;
+  }
+};
+
+// ---------------------------
+// Build layers based on dataset type
+// ---------------------------
+const layers = [
+  {
+    id: "basemap",
+    type: "raster",
+    source: "basemap"
+  }
+];
+
+// Add polygon layers for COUNTY/PLACE datasets
+if (isPolygonDataset) {
+  layers.push({
+    id: "place-fill",
+    type: "fill",
+    source: "local",
+    "source-layer": "layer0",
+    filter: ["==", "$type", "Polygon"],
+    paint: {
+      "fill-color": [
+        "match",
+        ["get", "STATEFP"],
+        "01", "#a6cee3",  // AL
+        "02", "#1f78b4",  // AK
+        "04", "#b2df8a",  // AZ
+        "05", "#33a02c",  // AR
+        "06", "#fb9a99",  // CA
+        "08", "#e31a1c",  // CO
+        "09", "#fdbf6f",  // CT
+        "10", "#ff7f00",  // DE
+        "11", "#cab2d6",  // DC
+        "12", "#6a3d9a",  // FL
+        "13", "#ffff99",  // GA
+        "15", "#b15928",  // HI
+        "16", "#8dd3c7",  // ID
+        "17", "#ffffb3",  // IL
+        "18", "#bebada",  // IN
+        "19", "#fb8072",  // IA
+        "20", "#80b1d3",  // KS
+        "21", "#fdb462",  // KY
+        "22", "#b3de69",  // LA
+        "23", "#fccde5",  // ME
+        "24", "#d9d9d9",  // MD
+        "25", "#bc80bd",  // MA
+        "26", "#ccebc5",  // MI
+        "27", "#ffed6f",  // MN
+        "28", "#1b9e77",  // MS
+        "29", "#d95f02",  // MO
+        "30", "#7570b3",  // MT
+        "31", "#e7298a",  // NE
+        "32", "#66a61e",  // NV
+        "33", "#e6ab02",  // NH
+        "34", "#a6761d",  // NJ
+        "35", "#666666",  // NM
+        "36", "#8dd3c7",  // NY
+        "37", "#ffffb3",  // NC
+        "38", "#bebada",  // ND
+        "39", "#fb8072",  // OH
+        "40", "#80b1d3",  // OK
+        "41", "#fdb462",  // OR
+        "42", "#b3de69",  // PA
+        "44", "#fccde5",  // RI
+        "45", "#d9d9d9",  // SC
+        "46", "#bc80bd",  // SD
+        "47", "#ccebc5",  // TN
+        "48", "#ffed6f",  // TX
+        "49", "#1b9e77",  // UT
+        "50", "#d95f02",  // VT
+        "51", "#7570b3",  // VA
+        "53", "#e7298a",  // WA
+        "54", "#66a61e",  // WV
+        "55", "#e6ab02",  // WI
+        "56", "#a6761d",  // WY
+        "#cccccc"
+      ],
+      "fill-opacity": 0.65
+    }
+  });
+
+  layers.push({
+    id: "place-outline",
+    type: "line",
+    source: "local",
+    "source-layer": "layer0",
+    filter: ["==", "$type", "Polygon"],
+    paint: {
+      "line-color": "#003366",
+      "line-width": 1.3,
+      "line-opacity": 0.9
+    }
+  });
+}
+
+// Add point layers for POINTLM datasets
+if (isPointDataset) {
+  layers.push({
+    id: "pointlm-points",
+    type: "circle",
+    source: "local",
+    "source-layer": "layer0",
+    filter: ["==", "$type", "Point"],
+    paint: {
+      "circle-radius": [
+        "interpolate",
+        ["linear"],
+        ["zoom"],
+        4, 2,
+        8, 4,
+        12, 7,
+        14, 10
+      ],
+      "circle-color": [
+        "match",
+        ["get", "MTFCC"],
+        "K2540", "#ff7f0e",   // Schools
+        "K2543", "#1f77b4",   // Hospitals
+        "K2450", "#2ca02c",   // Airports
+        "K1231", "#d62728",   // Summits
+        "K3340", "#9467bd",   // Parks
+        "K2380", "#8c564b",   // Cemeteries
+        "#aaaaaa"             // fallback
+      ],
+      "circle-opacity": 0.85,
+      "circle-stroke-width": 1,
+      "circle-stroke-color": "#000000"
+    }
+  });
+}
+
+// Add line layers for ROADS/RAILS datasets
+if (isRoadsDataset) {
+  layers.push(
+    {
+      id: "roads-lines",
+      type: "line",
+      source: "local",
+      "source-layer": "layer0",
+      filter: ["==", "$type", "LineString"],
+      paint: {
+        "line-color": "#ff6600",
+        "line-width": 2.0,
+        "line-opacity": 0.9
+      }
+    }
+  );
+}
+
+// Add generic point layer for any dataset with points
+layers.push({
+  id: "layer0-points",
+  type: "circle",
+  source: "local",
+  "source-layer": "layer0",
+  filter: ["==", "$type", "Point"],
+  paint: {
+    "circle-radius": 4,
+    "circle-color": "#ff0000",
+    "circle-stroke-width": 1,
+    "circle-stroke-color": "#ffffff",
+    "circle-opacity": 0.9
+  }
+});
+
+// Add generic line layer for any dataset with lines
+layers.push({
+  id: "layer0-lines",
+  type: "line",
+  source: "local",
+  "source-layer": "layer0",
+  filter: ["==", "$type", "LineString"],
+  paint: {
+    "line-color": "#0066cc",
+    "line-width": 1.5,
+    "line-opacity": 0.8
+  }
+});
+
+// Create the map
 const map = new maplibregl.Map({
   container: "map",
   style: {
@@ -33,134 +241,71 @@ const map = new maplibregl.Map({
       },
       local: {
         type: "vector",
-        tiles: ["http://127.0.0.1:5000/TIGER2018_PRISECROADS/{z}/{x}/{y}.mvt"],
+        tiles: [tileUrl],
         minzoom: 0,
         maxzoom: 14
       }
     },
-    layers: [
-      {
-        id: "basemap",
-        type: "raster",
-        source: "basemap"
-      },
-
-      // ---------------------------
-      // PRIMARY ROADS (RTTYP = M)
-      // ---------------------------
-      {
-        id: "roads-primary",
-        type: "line",
-        source: "local",
-        "source-layer": "layer0",
-        filter: ["==", ["get", "RTTYP"], "M"],
-        paint: {
-          "line-color": "#ff0000",
-          "line-width": [
-            "interpolate",
-            ["linear"],
-            ["zoom"],
-            4, 1.5,
-            8, 3.0,
-            12, 5.0
-          ],
-          "line-opacity": 0.95
-        }
-      },
-
-      // ---------------------------
-      // SECONDARY ROADS (RTTYP = S)
-      // ---------------------------
-      {
-        id: "roads-secondary",
-        type: "line",
-        source: "local",
-        "source-layer": "layer0",
-        filter: ["==", ["get", "RTTYP"], "S"],
-        paint: {
-          "line-color": "#ffa500",
-          "line-width": [
-            "interpolate",
-            ["linear"],
-            ["zoom"],
-            4, 1.2,
-            8, 2.0,
-            12, 3.0
-          ],
-          "line-opacity": 0.9
-        }
-      },
-
-      // ---------------------------
-      // LOCAL ROADS (RTTYP = C)
-      // ---------------------------
-      {
-        id: "roads-local",
-        type: "line",
-        source: "local",
-        "source-layer": "layer0",
-        filter: ["==", ["get", "RTTYP"], "C"],
-        paint: {
-          "line-color": "#cccccc",
-          "line-width": [
-            "interpolate",
-            ["linear"],
-            ["zoom"],
-            4, 0.8,
-            8, 1.2,
-            12, 2.0
-          ],
-          "line-opacity": 0.85
-        }
-      },
-
-      // ---------------------------
-      // RAMPS / CONNECTORS (RTTYP = P)
-      // ---------------------------
-      {
-        id: "roads-ramps",
-        type: "line",
-        source: "local",
-        "source-layer": "layer0",
-        filter: ["==", ["get", "RTTYP"], "P"],
-        paint: {
-          "line-color": "#ffff00",
-          "line-width": [
-            "interpolate",
-            ["linear"],
-            ["zoom"],
-            4, 0.8,
-            8, 1.2,
-            12, 2.0
-          ],
-          "line-opacity": 0.85
-        }
-      },
-
-      // ---------------------------
-      // TRAILS (RTTYP = T)
-      // ---------------------------
-      {
-        id: "roads-trails",
-        type: "line",
-        source: "local",
-        "source-layer": "layer0",
-        filter: ["==", ["get", "RTTYP"], "T"],
-        paint: {
-          "line-color": "#8b4513",
-          "line-width": 1.0,
-          "line-dasharray": [2, 2],
-          "line-opacity": 0.8
-        }
-      }
-    ]
+    layers: layers
   },
-
-  center: [-98, 38],
-  zoom: 4
+  center: [-120, 37],
+  zoom: 5
 });
 
 map.addControl(new maplibregl.NavigationControl());
+
+// ---------------------------
+// Popup for labels (POINTLM specific)
+// ---------------------------
+const popup = new maplibregl.Popup({
+  closeButton: false,
+  closeOnClick: false
+});
+
+if (isPointDataset) {
+  // Show popup on hover for POINTLM
+  map.on("mousemove", "pointlm-points", (e) => {
+    const feature = e.features[0];
+    const name = feature.properties.FULLNAME || "(Unnamed landmark)";
+    const mtfcc = feature.properties.MTFCC || "(no code)";
+
+    map.getCanvas().style.cursor = "pointer";
+
+    popup
+      .setLngLat(e.lngLat)
+      .setHTML(`
+        <b>${name}</b><br>
+        <span>MTFCC: ${mtfcc}</span>
+      `)
+      .addTo(map);
+  });
+
+  // Hide popup when mouse leaves point layer
+  map.on("mouseleave", "pointlm-points", () => {
+    map.getCanvas().style.cursor = "";
+    popup.remove();
+  });
+}
+
+// ---------------------------
+// Debug logs
+// ---------------------------
+map.on("data", e => {
+  if (e.sourceId === "local") console.log("[Maplibre data]", e);
+});
+
+map.on("sourcedata", e => {
+  if (e.sourceId === "local") {
+    console.log("[Tile event] state", e.tile && e.tile.state, 
+                "coord", e.tile && e.tile.coord, e);
+  }
+});
+
+map.on("error", e => console.error("[Maplibre error]", e));
+
+map.on("dataloading", e => {
+  if (e.sourceId === "local") console.log("[Loading tile]", e);
+});
 </script>
 
 </body>
