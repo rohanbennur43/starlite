@@ -1,5 +1,5 @@
 from .version import __version__
-from .datasource import DataSource, GeoParquetSource
+from .datasource import DataSource, GeoParquetSource, GeoJSONSource
 from .assigner import TileAssignerFromCSV
 from .writer_pool import WriterPool
 from .orchestrator import RoundOrchestrator

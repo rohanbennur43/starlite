@@ -275,9 +275,9 @@ import os
 import multiprocessing
 import logging
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -300,6 +300,18 @@ class SortMode:
     COLUMNS = "columns"
     ZORDER = "zorder"
     HILBERT = "hilbert"
+
+
+@dataclass(frozen=True)
+class _WriterPoolConfig:
+    geom_col: str
+    sort_mode: str
+    sort_keys: List[SortKey]
+    sfc_bits: int
+    global_extent: Optional[Tuple[float, float, float, float]]
+    compression: str
+    pq_args: Dict[str, Any]
+    outdir: str
 
 # ------------------------- Utility: Morton (Z-order) ----------------------
 
@@ -325,6 +337,127 @@ def _interleave_bits_2d(x: np.ndarray, y: np.ndarray, bits: int) -> np.ndarray:
         return n
 
     return (part1by1(y) << 1) | part1by1(x)
+
+def _maybe_sort_and_bbox(
+    tbl: pa.Table,
+    geom_col: str,
+    sort_mode: str,
+    sort_keys: List[SortKey],
+    sfc_bits: int,
+    global_extent: Optional[Tuple[float, float, float, float]],
+) -> Tuple[Tuple[float, float, float, float], pa.Table]:
+    geoms = from_wkb(tbl[geom_col].to_numpy(zero_copy_only=False))
+
+    minx = np.inf; miny = np.inf; maxx = -np.inf; maxy = -np.inf
+    has_geom = False
+    centers_x = []; centers_y = []
+
+    for g in geoms:
+        if g is None or g.is_empty:
+            continue
+        bxmin, bymin, bxmax, bymax = g.bounds
+        minx, miny = min(minx, bxmin), min(miny, bymin)
+        maxx, maxy = max(maxx, bxmax), max(maxy, bymax)
+        c = g.centroid
+        centers_x.append(float(c.x))
+        centers_y.append(float(c.y))
+        has_geom = True
+
+    if not has_geom:
+        bbox = (np.inf, np.inf, -np.inf, -np.inf)
+        return bbox, tbl
+
+    bbox = (float(minx), float(miny), float(maxx), float(maxy))
+
+    if sort_mode == SortMode.NONE:
+        return bbox, tbl
+
+    if sort_mode == SortMode.COLUMNS:
+        if not sort_keys:
+            return bbox, tbl
+        spec = [{"column": sk.column, "order": "ascending" if sk.ascending else "descending"}
+                for sk in sort_keys]
+        logger.debug("Sorting by columns: %s", spec)
+        return bbox, tbl.sort_by(spec)
+
+    if sort_mode in (SortMode.ZORDER, SortMode.HILBERT):
+        cx = np.asarray(centers_x, dtype=np.float64)
+        cy = np.asarray(centers_y, dtype=np.float64)
+        gxmin, gymin, gxmax, gymax = global_extent or bbox
+
+        X = _scale_to_uint(cx, gxmin, gxmax, sfc_bits)
+        Y = _scale_to_uint(cy, gymin, gymax, sfc_bits)
+        z = _interleave_bits_2d(X, Y, sfc_bits)
+
+        N = tbl.num_rows
+        max_code = np.uint64((1 << (2 * min(sfc_bits, 31))) - 1)
+        zfull = np.full(N, max_code, dtype=np.uint64)
+        valid_idx = [i for i, g in enumerate(geoms) if g and not g.is_empty]
+        if valid_idx:
+            zfull[np.asarray(valid_idx, dtype=np.int64)] = z
+        order = np.argsort(zfull, kind="mergesort")
+        logger.debug(f"Sorting {N} rows by Z-order (sfc_bits={sfc_bits})")
+        return bbox, tbl.take(pa.array(order, type=pa.int64()))
+
+    return bbox, tbl
+
+
+def _with_updated_geo_metadata(tbl: pa.Table, bbox: Tuple[float, float, float, float]) -> pa.Table:
+    schema = tbl.schema
+    meta = dict(schema.metadata or {})
+
+    geo_raw = meta.get(b"geo")
+    geo = {}
+    if geo_raw is not None:
+        try:
+            geo = json.loads(geo_raw.decode("utf8"))
+        except Exception:
+            geo = {}
+
+    # Update per-column bbox (correct place)
+    col = geo.setdefault("columns", {}).setdefault("geometry", {})
+    col["bbox"] = list(map(float, bbox))
+
+    # Optional but allowed: update table-level bbox too
+    geo["bbox"] = list(map(float, bbox))
+
+    meta[b"geo"] = json.dumps(geo).encode("utf8")
+
+    return tbl.replace_schema_metadata(meta)
+
+
+def _finalize_one_tile(tile_id: int, batches: List[pa.Table], config: _WriterPoolConfig) -> str:
+    label = f"tile_{tile_id:06d}"
+    logger.debug(f"[{label}] Concatenating {len(batches)} batches.")
+    full = pa.concat_tables(batches, promote=True)
+    full = ensure_large_types(full, config.geom_col)
+
+    # 🔽 Drop the internal routing column if it exists
+    if "geo_parquet_tile_num" in full.column_names:
+        logger.debug(f"[{label}] Dropping internal column 'geo_parquet_tile_num'")
+        full = full.drop(["geo_parquet_tile_num"])
+
+    bbox, full = _maybe_sort_and_bbox(
+        full,
+        geom_col=config.geom_col,
+        sort_mode=config.sort_mode,
+        sort_keys=config.sort_keys,
+        sfc_bits=config.sfc_bits,
+        global_extent=config.global_extent,
+    )
+    full = _with_updated_geo_metadata(full, bbox)
+    minx, miny, maxx, maxy = bbox
+    safe = lambda v: f"{v:.6f}".replace(".", "_")
+    bbox_str = f"{safe(minx)}_{safe(miny)}_{safe(maxx)}_{safe(maxy)}"
+
+    filename = f"{label}__{bbox_str}.parquet"
+    out_path = os.path.join(config.outdir, filename)
+
+    logger.info(f"[{label}] Writing to disk → {out_path}")
+    pq.write_table(full, out_path, compression=config.compression, **config.pq_args)
+    logger.debug(f"[{label}] Flush complete, rows={full.num_rows}")
+    return out_path
+
 
 # ------------------------- Writer Pool -------------------------
 
@@ -362,13 +495,13 @@ class WriterPool:
         else:
             self.max_parallel_files = max(1, int(max_parallel_files))
 
-        self._buffers: Dict[str, List[pa.Table]] = defaultdict(list)
+        self._buffers: Dict[int, List[pa.Table]] = defaultdict(list)
 
     # --------------------------- Public API ---------------------------
 
-    def append(self, tile_id: str, table: pa.Table) -> None:
-        logger.info("\n--- DEBUG: WriterPool.append ---")
-        logger.info("Incoming metadata: %s", table.schema.metadata)
+    def append(self, tile_id: int, table: pa.Table) -> None:
+        logger.debug("\n--- DEBUG: WriterPool.append ---")
+        logger.debug("Incoming metadata: %s", table.schema.metadata)
 
         if table is None or table.num_rows == 0:
             return
@@ -390,32 +523,21 @@ class WriterPool:
         total = len(items)
         mpf = min(self.max_parallel_files, total)
         rounds = math.ceil(total / mpf)
-        logger.info(f"WriterPool.flush_all(): {total} tiles buffered → flushing in {rounds} round(s), "
-                    f"{mpf} parallel writes per round.")
+        logger.info(
+            f"WriterPool.flush_all(): {total} tiles buffered → flushing in {rounds} round(s), "
+            f"{mpf} parallel writes per round."
+        )
 
-        def _finalize_one_tile(tile_id: str, batches: List[pa.Table]) -> str:
-            logger.debug(f"[{tile_id}] Concatenating {len(batches)} batches.")
-            full = pa.concat_tables(batches, promote=True)
-            full = ensure_large_types(full, self.geom_col)
-
-            # 🔽 Drop the internal routing column if it exists
-            if "geo_parquet_tile_num" in full.column_names:
-                logger.debug(f"[{tile_id}] Dropping internal column 'geo_parquet_tile_num'")
-                full = full.drop(["geo_parquet_tile_num"])
-
-            bbox, full = self._maybe_sort_and_bbox(full)
-            full = self._with_updated_geo_metadata(full, bbox)
-            minx, miny, maxx, maxy = bbox
-            safe = lambda v: f"{v:.6f}".replace(".", "_")
-            bbox_str = f"{safe(minx)}_{safe(miny)}_{safe(maxx)}_{safe(maxy)}"
-
-            filename = f"{tile_id}__{bbox_str}.parquet"
-            out_path = os.path.join(self.outdir, filename)
-
-            logger.info(f"[{tile_id}] Writing to disk → {out_path}")
-            pq.write_table(full, out_path, compression=self.compression, **self._pq_args)
-            logger.debug(f"[{tile_id}] Flush complete, rows={full.num_rows}")
-            return out_path
+        config = _WriterPoolConfig(
+            geom_col=self.geom_col,
+            sort_mode=self.sort_mode,
+            sort_keys=list(self._sort_keys),
+            sfc_bits=self.sfc_bits,
+            global_extent=self.global_extent,
+            compression=self.compression,
+            pq_args=dict(self._pq_args),
+            outdir=self.outdir,
+        )
 
         for r in range(rounds):
             start = r * mpf
@@ -423,10 +545,10 @@ class WriterPool:
             logger.info(f"WriterPool: round {r+1}/{rounds} — writing {len(batch)} tiles to disk.")
             if len(batch) == 1:
                 tid, b = batch[0]
-                _finalize_one_tile(tid, b)
+                _finalize_one_tile(tid, b, config)
                 continue
-            with ThreadPoolExecutor(max_workers=len(batch)) as ex:
-                futs = {ex.submit(_finalize_one_tile, tid, b): tid for tid, b in batch}
+            with ProcessPoolExecutor(max_workers=len(batch)) as ex:
+                futs = {ex.submit(_finalize_one_tile, tid, b, config): tid for tid, b in batch}
                 for f in as_completed(futs):
                     try:
                         _ = f.result()
@@ -461,82 +583,3 @@ class WriterPool:
             else:
                 raise TypeError(f"Unsupported sort key type: {type(k)}")
         return out
-
-    def _maybe_sort_and_bbox(self, tbl: pa.Table) -> Tuple[Tuple[float, float, float, float], pa.Table]:
-        geoms = from_wkb(tbl[self.geom_col].to_numpy(zero_copy_only=False))
-
-        minx = np.inf; miny = np.inf; maxx = -np.inf; maxy = -np.inf
-        has_geom = False
-        centers_x = []; centers_y = []
-
-        for g in geoms:
-            if g is None or g.is_empty:
-                continue
-            bxmin, bymin, bxmax, bymax = g.bounds
-            minx, miny = min(minx, bxmin), min(miny, bymin)
-            maxx, maxy = max(maxx, bxmax), max(maxy, bymax)
-            c = g.centroid
-            centers_x.append(float(c.x))
-            centers_y.append(float(c.y))
-            has_geom = True
-
-        if not has_geom:
-            bbox = (np.inf, np.inf, -np.inf, -np.inf)
-            return bbox, tbl
-
-        bbox = (float(minx), float(miny), float(maxx), float(maxy))
-
-        if self.sort_mode == SortMode.NONE:
-            return bbox, tbl
-
-        if self.sort_mode == SortMode.COLUMNS:
-            if not self._sort_keys:
-                return bbox, tbl
-            spec = [{"column": sk.column, "order": "ascending" if sk.ascending else "descending"}
-                    for sk in self._sort_keys]
-            logger.debug("Sorting by columns: %s", spec)
-            return bbox, tbl.sort_by(spec)
-
-        if self.sort_mode in (SortMode.ZORDER, SortMode.HILBERT):
-            cx = np.asarray(centers_x, dtype=np.float64)
-            cy = np.asarray(centers_y, dtype=np.float64)
-            gxmin, gymin, gxmax, gymax = self.global_extent or bbox
-
-            X = _scale_to_uint(cx, gxmin, gxmax, self.sfc_bits)
-            Y = _scale_to_uint(cy, gymin, gymax, self.sfc_bits)
-            z = _interleave_bits_2d(X, Y, self.sfc_bits)
-
-            N = tbl.num_rows
-            max_code = np.uint64((1 << (2 * min(self.sfc_bits, 31))) - 1)
-            zfull = np.full(N, max_code, dtype=np.uint64)
-            valid_idx = [i for i, g in enumerate(geoms) if g and not g.is_empty]
-            if valid_idx:
-                zfull[np.asarray(valid_idx, dtype=np.int64)] = z
-            order = np.argsort(zfull, kind="mergesort")
-            logger.debug(f"Sorting {N} rows by Z-order (sfc_bits={self.sfc_bits})")
-            return bbox, tbl.take(pa.array(order, type=pa.int64()))
-
-        return bbox, tbl
-
-    def _with_updated_geo_metadata(self, tbl, bbox):
-        schema = tbl.schema
-        meta = dict(schema.metadata or {})
-
-        geo_raw = meta.get(b"geo")
-        geo = {}
-        if geo_raw is not None:
-            try:
-                geo = json.loads(geo_raw.decode("utf8"))
-            except Exception:
-                geo = {}
-
-        # Update per-column bbox (correct place)
-        col = geo.setdefault("columns", {}).setdefault("geometry", {})
-        col["bbox"] = list(map(float, bbox))
-
-        # Optional but allowed: update table-level bbox too
-        geo["bbox"] = list(map(float, bbox))
-
-        meta[b"geo"] = json.dumps(geo).encode("utf8")
-
-        return tbl.replace_schema_metadata(meta)

@@ -4,6 +4,7 @@ import logging
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+from time import perf_counter
 
 from shapely import from_wkb
 from .RSGrove import RSGrovePartitioner, BeastOptions, EnvelopeNDLite
@@ -90,6 +91,9 @@ class RSGroveAssigner:
         self._geom_col = geom_col
         self._boxes = boxes or []  # list of (pid, minx, miny, maxx, maxy)
         self._areas = {pid: (xmax - xmin) * (ymax - ymin) for pid, xmin, ymin, xmax, ymax in self._boxes}
+        self._smallest_area_pid = min(self._areas, key=self._areas.get) if self._areas else None
+        # Pre-sort partitions by xmin for plane-sweep filtering.
+        self._boxes_by_xmin = sorted(self._boxes, key=lambda b: b[1])
         logger.info("RSGroveAssigner ready with %d partitions", self._part.numPartitions())
 
     @property
@@ -237,17 +241,32 @@ class RSGroveAssigner:
         xmin, ymin, xmax, ymax = bbox
         return not (gmaxx < xmin or gminx > xmax or gmaxy < ymin or gminy > ymax)
 
+    @staticmethod
+    def _expansion_area(bbox: Tuple[float, float, float, float],
+                        gminx: float, gminy: float, gmaxx: float, gmaxy: float) -> float:
+        xmin, ymin, xmax, ymax = bbox
+        new_xmin = min(xmin, gminx)
+        new_ymin = min(ymin, gminy)
+        new_xmax = max(xmax, gmaxx)
+        new_ymax = max(ymax, gmaxy)
+        new_area = (new_xmax - new_xmin) * (new_ymax - new_ymin)
+        old_area = (xmax - xmin) * (ymax - ymin)
+        return new_area - old_area
 
-    def partition_by_tile(self, tbl: pa.Table) -> Dict[str, pa.Table]:
+
+    def partition_by_tile(self, tbl: pa.Table) -> pa.Table:
         """
-        CONTAINS-ONLY assignment:
-          - Assign a row to the smallest-area tile whose MBR fully contains the row's bbox.
-          - If none contains, the row is SKIPPED.
+        Center-first assignment with fallback expansion minimization:
+          - Assign a row to the first partition whose MBR contains the row's centroid.
+          - If none contains the centroid, assign to the partition that requires the
+            least MBR expansion to encompass the centroid (point-based).
+          - Returns a table of partition IDs aligned with the input order.
         """
         logger.info("[ASSIGNER] After ensure_large_types metadata: %s", tbl.schema.metadata)
+        start_time = perf_counter()
 
         if tbl.num_rows == 0:
-            return {}
+            return pa.table({"partition_id": pa.array([], type=pa.int32())})
         if self._geom_col not in tbl.column_names:
             raise ValueError(f"Missing geometry column '{self._geom_col}'")
 
@@ -257,36 +276,73 @@ class RSGroveAssigner:
 
         geoms = from_wkb(t[self._geom_col].to_numpy(zero_copy_only=False))
 
-        row_ids_by_pid: Dict[int, List[int]] = {}
-        assigned = 0
-        skipped = 0
-
+        # Pre-compute centroids and sort by x for plane sweep.
+        geom_info: List[Tuple[float, float, int]] = []  # (cx, cy, idx)
+        partition_ids: List[int] = [-1] * t.num_rows
         for i, g in enumerate(geoms):
+            # Degenerate/empty geometries fall back to the smallest partition by area.
             if g is None or g.is_empty:
-                skipped += 1
+                fallback_pid = self._smallest_area_pid
+                if fallback_pid is None:
+                    raise ValueError(f"No partition found for geometry at index {i}")
+                partition_ids[i] = int(fallback_pid)
                 continue
-            gminx, gminy, gmaxx, gmaxy = g.bounds
 
-            chosen_pid = None
-            chosen_area = float("inf")
-            for pid, xmin, ymin, xmax, ymax in self._boxes:
-                if self._intersects((xmin, ymin, xmax, ymax), gminx, gminy, gmaxx, gmaxy):
-                    area = self._areas[pid]
-                    if area < chosen_area:
-                        chosen_area = area
+            cx, cy = g.centroid.x, g.centroid.y
+            geom_info.append((cx, cy, i))
+
+        geom_info.sort(key=lambda x: x[0])  # sort by centroid x
+
+        start_idx = 0
+        end_idx = 0
+        n_parts = len(self._boxes_by_xmin)
+
+        if n_parts == 0:
+            raise ValueError("No partitions available for assignment")
+
+        for cx, cy, i in geom_info:
+            # Expand active window: include partitions whose xmin is now in range (xmin <= cx).
+            while end_idx < n_parts and self._boxes_by_xmin[end_idx][1] <= cx:
+                end_idx += 1
+
+            # Shrink active window: drop partitions whose xmax is left of the centroid (xmax < cx).
+            while start_idx < end_idx and self._boxes_by_xmin[start_idx][3] < cx:
+                start_idx += 1
+
+            chosen_pid: int = -1
+
+            # First pass: centroid containment among active partitions.
+            for idx in range(start_idx, end_idx):
+                pid, xmin, ymin, xmax, ymax = self._boxes_by_xmin[idx]
+                if self._contains_inclusive((xmin, ymin, xmax, ymax), cx, cy, cx, cy):
+                    chosen_pid = pid
+                    break
+
+            # Fallback: minimal expansion among active partitions; if none, fall back to smallest partition.
+            if chosen_pid == -1:
+                if start_idx < end_idx:
+                    candidate_range = range(start_idx, end_idx)
+                else:
+                    candidate_range = range(n_parts)
+                chosen_expansion = float("inf")
+                for idx in candidate_range:
+                    pid, xmin, ymin, xmax, ymax = self._boxes_by_xmin[idx]
+                    expansion = self._expansion_area((xmin, ymin, xmax, ymax), cx, cy, cx, cy)
+                    if expansion < chosen_expansion:
+                        chosen_expansion = expansion
                         chosen_pid = pid
 
-            if chosen_pid is None:
-                skipped += 1
-                continue
+            if chosen_pid == -1:
+                chosen_pid = int(self._smallest_area_pid) if self._smallest_area_pid is not None else -1
+            assert chosen_pid != -1, f"No partition found for geometry at index {i}"
+            partition_ids[i] = int(chosen_pid)
 
-            row_ids_by_pid.setdefault(int(chosen_pid), []).append(i)
-            assigned += 1
+        if any(pid == -1 for pid in partition_ids):
+            raise ValueError("Failed to assign partitions for all rows")
 
-        out: Dict[str, pa.Table] = {}
-        for pid, idxs in row_ids_by_pid.items():
-            out[f"tile_{pid:06d}"] = t.take(pa.array(idxs, type=pa.int32()))
+        out = pa.table({"partition_id": pa.array(partition_ids, type=pa.int32())})
+        end_time = perf_counter()
 
-        logger.info("partition_by_tile (contains-only): input_rows=%d, assigned=%d, skipped=%d, tiles=%d",
-                    t.num_rows, assigned, skipped, len(out))
+        logger.info("partition_by_tile (contains-only): input_rows=%d, tiles=%d, finished in %.3f seconds, with a rate of %.3f rows/second",
+                    t.num_rows, len(out), end_time - start_time, t.num_rows / (end_time - start_time) if end_time != start_time else 0)
         return out

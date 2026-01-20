@@ -4,7 +4,10 @@ import logging
 from pathlib import Path
 import numpy as np
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(relativeCreated).0fms] %(levelname)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
@@ -94,6 +97,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 

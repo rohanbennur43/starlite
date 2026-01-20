@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -85,34 +85,44 @@ def _accumulate_vertices_hist(
     geoms = from_wkb(table[geom_col].to_numpy(zero_copy_only=False))
 
     minx, miny, maxx, maxy = bbox_out
+    inv_w = 1.0 / (maxx - minx)
+    inv_h = 1.0 / (maxy - miny)
+
+    all_xs: list[float] = []
+    all_ys: list[float] = []
 
     for g in geoms:
         if g is None or g.is_empty:
             continue
 
-        xs, ys = [], []
-        for x, y in _geometry_vertices_iter(g):
-            xs.append(x)
-            ys.append(y)
-
-        if not xs:
+        coords = list(_geometry_vertices_iter(g))
+        if not coords:
             continue
+        
+        xs, ys = zip(*coords)
+        all_xs.extend(xs)
+        all_ys.extend(ys)
 
-        X, Y = transformer.transform(xs, ys)
+    if not all_xs:
+        return hist
+    
+    X, Y = transformer.transform(all_xs, all_ys)
 
-        tx = (np.asarray(X) - minx) / (maxx - minx)
-        ty = (np.asarray(Y) - miny) / (maxy - miny)
+    X = np.asarray(X)
+    Y = np.asarray(Y)
 
-        ix = np.floor(tx * n).astype(np.int64)
-        iy = np.floor(ty * n).astype(np.int64)
+    tx = (X - minx) * inv_w
+    ty = (Y - miny) * inv_h
+    
+    ix = np.floor(tx * n).astype(np.int64, copy=False)
+    iy = np.floor(ty * n).astype(np.int64, copy=False)
+    
+    np.clip(ix, 0, n - 1, out=ix)
+    np.clip(iy, 0, n - 1, out=iy)
 
-        np.clip(ix, 0, n - 1, out=ix)
-        np.clip(iy, 0, n - 1, out=iy)
+    iy = n - 1 - iy
 
-        # Flip Y so that (0,0) is top left to match MVT coordinate orientation
-        iy = n - 1 - iy
-
-        np.add.at(hist, (iy, ix), 1)
+    np.add.at(hist, (iy, ix), 1)
 
     return hist
 
@@ -121,7 +131,7 @@ def _accumulate_vertices_hist(
 # PROCESS ONE TILE
 # ---------------------------------------------------------------------------
 
-def _process_one_tile(parquet_path: Path, outdir: Path, cfg, geom_col: str) -> Path:
+def _process_one_tile(parquet_path: Path, cfg, geom_col: str) -> np.ndarray:
 
     tile_id = parquet_path.stem
     logger.info(f"Processing tile: {tile_id}")
@@ -134,46 +144,41 @@ def _process_one_tile(parquet_path: Path, outdir: Path, cfg, geom_col: str) -> P
 
     base = np.zeros((cfg.grid_size, cfg.grid_size), dtype=dtype)
 
-    with ThreadPoolExecutor(max_workers=cfg.rg_parallel) as ex:
-        futures = [
-            ex.submit(
-                _accumulate_vertices_hist,
-                pf.read_row_group(rg, columns=[geom_col]).combine_chunks(),
-                geom_col,
-                bbox,
-                transformer,
-                cfg.grid_size,
-                dtype
-            )
-            for rg in range(pf.metadata.num_row_groups)
-        ]
+    # Avoid per-tile thread pools: we already parallelize across tiles, and
+    # row-group level fan-out adds overhead and thread contention. Process each
+    # row group directly and accumulate into a single histogram buffer.
+    for rg in range(pf.metadata.num_row_groups):
+        hist = _accumulate_vertices_hist(
+            pf.read_row_group(rg, columns=[geom_col]).combine_chunks(),
+            geom_col,
+            bbox,
+            transformer,
+            cfg.grid_size,
+            dtype,
+        )
+        base += hist
 
-        for f in as_completed(futures):
-            base += f.result()
-
-    out_path = outdir / f"{tile_id}_L0.npy"
-    np.save(out_path, base, allow_pickle=False)
-
-    return out_path
+    return base
 
 
 # ---------------------------------------------------------------------------
 # GLOBAL SUM AND PREFIX SUM
 # ---------------------------------------------------------------------------
 
-def _sum_all_tiles(tile_files: List[Path], outdir: Path, dtype="float64") -> Path:
+def _sum_all_tiles(tile_hists: List[np.ndarray], outdir: Path, dtype="float64") -> Path:
 
-    if not tile_files:
+    if not tile_hists:
         raise RuntimeError("No tile histograms generated")
 
-    example = np.load(tile_files[0], mmap_mode="r")
+    example = tile_hists[0]
     total = np.zeros_like(example, dtype=dtype)
 
-    for f in tile_files:
-        arr = np.load(f, mmap_mode="r")
-        if arr.shape != total.shape:
-            raise ValueError(f"Tile {f} has shape {arr.shape}, expected {total.shape}")
-        total += arr
+    for hist in tile_hists:
+        if hist.shape != total.shape:
+            raise ValueError(
+                f"Tile histogram has shape {hist.shape}, expected {total.shape}"
+            )
+        total += hist
 
     global_path = outdir / "global.npy"
     np.save(global_path, total, allow_pickle=False)
@@ -207,9 +212,6 @@ def _sum_all_tiles(tile_files: List[Path], outdir: Path, dtype="float64") -> Pat
     }
     with open(outdir / "global_prefix.json", "w") as f:
         json.dump(prefix_json, f, indent=2)
-
-    for f in tile_files:
-        f.unlink(missing_ok=True)
 
     logger.info(f"Wrote global histogram: {global_path}")
     logger.info(f"Wrote global prefix sum histogram: {prefix_path}")
@@ -247,9 +249,9 @@ def build_histograms_for_dir(
 
     tile_outputs = []
 
-    with ThreadPoolExecutor(max_workers=cfg.max_parallel_tiles) as ex:
+    with ProcessPoolExecutor(max_workers=cfg.max_parallel_tiles) as ex:
         futures = {
-            ex.submit(_process_one_tile, p, outdir_p, cfg, geom_col): p
+            ex.submit(_process_one_tile, p, cfg, geom_col): p
             for p in tiles
         }
 

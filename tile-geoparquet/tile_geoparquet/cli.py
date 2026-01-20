@@ -1,6 +1,9 @@
 from __future__ import annotations
 import argparse
 import logging
+from pathlib import Path
+from time import perf_counter
+import math
 
 from .datasource import GeoParquetSource, GeoJSONSource, is_geojson_path
 from .assigner import TileAssignerFromCSV, RSGroveAssigner
@@ -8,7 +11,10 @@ from .orchestrator import RoundOrchestrator
 from .writer_pool import SortMode, SortKey
 from .hist_pyramid import build_histograms_for_dir
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(relativeCreated).0fms] %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +55,35 @@ def _parse_sort_keys(keys: str | None):
     return out
 
 
+_SIZE_SUFFIXES = {
+    "kb": 1024,
+    "mb": 1024 ** 2,
+    "gb": 1024 ** 3,
+    "tb": 1024 ** 4,
+}
+
+
+def _parse_partition_size_bytes(raw: str) -> int:
+    """
+    Parse a human-friendly size string into bytes.
+
+    Examples: "1073741824", "1gb", "512mb".
+    """
+    s = raw.strip().lower()
+    if s.isdigit():
+        return int(s)
+
+    for suffix, mul in _SIZE_SUFFIXES.items():
+        if s.endswith(suffix):
+            num = s[: -len(suffix)].strip()
+            try:
+                return int(float(num) * mul)
+            except ValueError:
+                break
+
+    raise argparse.ArgumentTypeError(f"Invalid partition size: {raw}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="GeoJSON/GeoParquet → tiled GeoParquet (round-based, bounded writers, single final writes)."
@@ -73,6 +108,8 @@ def main():
     ap.add_argument("--index", help="CSV index with columns: id,minx,miny,maxx,maxy (legacy mode).")
     ap.add_argument("--num-tiles", type=int, help="Number of tiles to build via RSGrove (preferred).")
     ap.add_argument("--seed", type=int, default=42, help="Seed for RSGrove (if --num-tiles is used).")
+    ap.add_argument("--partition-size", type=_parse_partition_size_bytes, default=1 << 30,
+                    help="Target partition size (bytes). Accepts suffixes KB, MB, GB, TB. Default: 1GB.")
 
     # Sampling (RSGrove)
     ap.add_argument("--sample-ratio", type=float, default=1.0,
@@ -83,25 +120,38 @@ def main():
     args = ap.parse_args()
 
     source = build_source(args.input, geom_col=args.geom_col)
+    input_size_bytes = Path(args.input).stat().st_size
+    computed_partitions = max(1, math.ceil(input_size_bytes / args.partition_size))
+    if args.num_tiles:
+        target_partitions = int(args.num_tiles)
+        logger.info(
+            "Input size=%d bytes, partition size=%d bytes -> computed %d partitions (using --num-tiles=%d).",
+            input_size_bytes, args.partition_size, computed_partitions, target_partitions,
+        )
+    else:
+        target_partitions = computed_partitions
+        logger.info(
+            "Input size=%d bytes, partition size=%d bytes -> using %d partitions.",
+            input_size_bytes, args.partition_size, target_partitions,
+        )
 
     if args.index:
         logger.info("Using TileAssignerFromCSV with index=%s", args.index)
         assigner = TileAssignerFromCSV(args.index, geom_col=args.geom_col)
     else:
-        if not args.num_tiles:
-            ap.error("You must supply either --index (CSV) or --num-tiles (RSGrove).")
         logger.info(
             "Building RSGroveAssigner from source with num_tiles=%d seed=%d ratio=%.4f cap=%s",
-            args.num_tiles, args.seed, args.sample_ratio, str(args.sample_cap),
+            target_partitions, args.seed, args.sample_ratio, str(args.sample_cap),
         )
         assigner = RSGroveAssigner.from_source(
             tables=source.iter_tables(),  # streaming
-            num_partitions=args.num_tiles,
+            num_partitions=target_partitions,
             geom_col=args.geom_col,
             seed=args.seed,
             sample_ratio=args.sample_ratio,
             sample_cap=args.sample_cap,
         )
+
 
     orchestrator = RoundOrchestrator(
         source=source,

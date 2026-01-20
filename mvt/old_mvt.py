@@ -537,7 +537,7 @@ from shapely.ops import transform
 from pyproj import Transformer
 import mapbox_vector_tile
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(relativeCreated).0fms] %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("bucket_mvt")
 
 WORLD_MINX = -20037508.342789244

@@ -14,7 +14,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     level = getattr(logging, args.log_level.upper(), logging.INFO)
-    logging.basicConfig(level=level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(relativeCreated).0fms] - %(name)s - %(levelname)s - %(message)s",
+    )
     logger.info(f"Starting MVT generation with dir={args.dir}, zoom={args.zoom}, threshold={args.threshold}, log_level={args.log_level}")
 
     gen = BucketMVTGenerator(

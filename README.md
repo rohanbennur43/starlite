@@ -1,8 +1,18 @@
 # Geospatial Data Visualiser
 This repository provides a simple Makefile driven workflow to generate spatial tiles and Mapbox Vector Tiles from Parquet datasets. All steps run through a few make targets and produce logs automatically.
+
+## Setup
+
+```shell
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ./tile-geoparquet
+pip install -r requirements.txt
+```
+
 ## Make Targets
 
-### `make tiles`
+### `make tiles INPUT=<input-path>`
 Runs the tiling pipeline.
 
 - Splits the input dataset into 40 tiles.
