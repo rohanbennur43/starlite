@@ -24,4 +24,5 @@ six==1.17.0
 -e git+ssh://git@github.com/rohanbennur43/ucr-bigdatalab-starmap.git@dd925c1c00d098a129e4fd4b0f45e62b7c299323#egg=tile_geoparquet&subdirectory=tile-geoparquet
 tzdata==2025.2
 Werkzeug==3.1.3
+datasketch==1.6.1
 -e tile-geoparquet

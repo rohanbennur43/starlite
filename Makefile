@@ -68,15 +68,13 @@ mvt:
 # ----------------------------
 
 server:
-	python3 server/server.py --root datasets &
-	sleep 2
-	@if command -v xdg-open >/dev/null 2>&1; then \
-		xdg-open http://127.0.0.1:5000; \
-	elif command -v open >/dev/null 2>&1; then \
-		open http://127.0.0.1:5000; \
-	else \
-		echo "Server running at http://127.0.0.1:5000"; \
+	@echo "Starting server at http://127.0.0.1:5000"
+	@echo "Press Ctrl+C to stop"
+	@sleep 1
+	@if command -v open >/dev/null 2>&1; then \
+		open http://127.0.0.1:5000 & \
 	fi
+	python3 server/server.py --root datasets
 
 # ----------------------------
 # Clean

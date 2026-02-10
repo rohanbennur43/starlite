@@ -99,3 +99,64 @@ The viewer automatically detects geometry types and applies appropriate renderin
 - MapLibre GL error reporting
 - Network request inspection
 
+## Styling Guide
+
+For detailed instructions on customizing map styling for Points, Polygons, and Lines, see [server/STYLING_GUIDE.md](server/STYLING_GUIDE.md).
+
+### Quick Examples
+
+**Color counties by state (Polygons):**
+```javascript
+"fill-color": [
+  "match",
+  ["get", "STATEFP"],
+  "06", "#ff0000",  // California
+  "48", "#0000ff",  // Texas
+  "#cccccc"         // Others
+]
+```
+
+**Color landmarks by type (Points):**
+```javascript
+"circle-color": [
+  "match",
+  ["get", "MTFCC"],
+  "K2540", "#ff7f0e",   // Schools
+  "K2543", "#1f77b4",   // Hospitals
+  "#aaaaaa"             // Default
+]
+```
+
+**Color roads by type (Lines):**
+```javascript
+"line-color": [
+  "match",
+  ["get", "RTTYP"],
+  "M", "#ff0000",  // Major roads
+  "S", "#ffa500",  // Secondary
+  "#0066cc"        // Local
+]
+```
+
+
+## Prerequisites
+
+### Unix Systems
+- Ensure you have Python 3.6 or higher installed.
+- Install `make` if not already available.
+
+### Non-Unix Systems
+- Install Python 3.6 or higher.
+- Use a compatible `make` alternative or manually execute the commands in the Makefile.
+
+### Activating the Virtual Environment
+- Run the following commands to set up and activate the virtual environment:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+### Dataset Requirement
+- Download the required datasets from the UCR STAR repository.
+- Place the datasets in the `datasets/` directory following the structure outlined in this repository.
