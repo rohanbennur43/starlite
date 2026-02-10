@@ -99,6 +99,57 @@ def download_features(dataset, format):
     except Exception as e:
         return {"error": f"Internal error: {str(e)}"}, 500
 
+@app.post("/datasets/<dataset>/features.<format>")
+def download_features_with_geometry(dataset, format):
+    """
+    Download dataset features in the specified format with optional spatial filtering.
+    Supports GeoJSON payloads for custom geometry queries.
+
+    Query params:
+        mbr: Optional Minimum Bounding Rectangle as "minx,miny,maxx,maxy"
+
+    Payload:
+        GeoJSON representation of a custom geometry to filter the dataset.
+    """
+    dataset_path = DATA_ROOT / dataset
+
+    if not dataset_path.exists() or not dataset_path.is_dir():
+        return {"error": "Dataset not found"}, 404
+
+    try:
+        # Check for GeoJSON payload
+        geojson_payload = request.get_json()
+        mbr_string = request.args.get("mbr", default=None)
+
+        if geojson_payload:
+            # Use GeoJSON geometry for filtering
+            geometry = geojson_payload.get("geometry")
+            if not geometry:
+                return {"error": "Invalid GeoJSON payload: 'geometry' field is required"}, 400
+
+            feature_stream = feature_service.get_features_stream(dataset, format, geometry=geometry)
+        else:
+            # Use MBR for filtering if no GeoJSON payload
+            feature_stream = feature_service.get_features_stream(dataset, format, mbr_string)
+
+        # Determine mime type and filename
+        mime_type = feature_service.get_mime_type(format)
+        filename = f"{dataset}_filtered.{format}" if geojson_payload else f"{dataset}_mbr.{format}"
+
+        # Stream response
+        return Response(
+            feature_stream,
+            mimetype=mime_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    except FileNotFoundError as e:
+        return {"error": str(e)}, 404
+    except Exception as e:
+        return {"error": f"Internal error: {str(e)}"}, 500
+
 @app.get("/api/datasets/<dataset>/stats")
 def get_dataset_stats(dataset):
     """
@@ -116,23 +167,137 @@ def get_dataset_stats(dataset):
         return {"error": f"Failed to load stats: {str(e)}"}, 500
 
 @app.get("/datasets.json")
-def list_datasets_with_metadata():
+def search_datasets():
     """
-    Lists all datasets available in the system with their names, IDs, and additional metadata.
+    Searches for datasets that match the given query and returns them.
+    Query parameter:
+        q: The search query to filter datasets by name or ID.
     """
+    query = request.args.get("q", default=None)
     datasets = []
+
     if DATA_ROOT.exists():
         for d in DATA_ROOT.iterdir():
             if d.is_dir():
-                # Example metadata: name, ID, and size
                 dataset_metadata = {
                     "id": d.name,
                     "name": d.name.replace("_", " ").title(),
                     "size": sum(f.stat().st_size for f in d.rglob("*") if f.is_file()),
                 }
-                datasets.append(dataset_metadata)
+
+                # If a query is provided, filter datasets by name or ID
+                if query is None or query.lower() in d.name.lower():
+                    datasets.append(dataset_metadata)
 
     return json.dumps({"datasets": datasets}, indent=2)
+
+@app.get("/datasets/<dataset>.json")
+def get_dataset_metadata(dataset):
+    """
+    Returns detailed metadata for a specific dataset.
+    """
+    dataset_path = DATA_ROOT / dataset
+
+    if not dataset_path.exists() or not dataset_path.is_dir():
+        return {"error": "Dataset not found"}, 404
+
+    try:
+        # Example metadata: name, ID, size, and number of files
+        metadata = {
+            "id": dataset,
+            "name": dataset.replace("_", " ").title(),
+            "size": sum(f.stat().st_size for f in dataset_path.rglob("*") if f.is_file()),
+            "file_count": sum(1 for f in dataset_path.rglob("*") if f.is_file()),
+        }
+        return json.dumps(metadata, indent=2)
+    except Exception as e:
+        return {"error": f"Failed to retrieve metadata: {str(e)}"}, 500
+
+@app.get("/datasets/<dataset>.html")
+def visualize_dataset(dataset):
+    """
+    Returns a minimal HTML page for visualizing the dataset.
+    """
+    dataset_path = DATA_ROOT / dataset
+
+    if not dataset_path.exists() or not dataset_path.is_dir():
+        return "<h1>Dataset not found</h1>", 404
+
+    try:
+        # Render a simple HTML page for visualization
+        return render_template(
+            "view_dataset.html",
+            dataset_id=dataset,
+            dataset_name=dataset.replace("_", " ").title(),
+        )
+    except Exception as e:
+        return f"<h1>Failed to render visualization: {str(e)}</h1>", 500
+
+@app.get("/datasets/<dataset>/features/sample.json")
+def get_sample_non_geometry_attributes(dataset):
+    """
+    Return non-geometry attributes of the first record that matches the given MBR.
+
+    Query params:
+        mbr: Minimum Bounding Rectangle as "minx,miny,maxx,maxy"
+    """
+    dataset_path = DATA_ROOT / dataset
+
+    if not dataset_path.exists() or not dataset_path.is_dir():
+        return {"error": "Dataset not found"}, 404
+
+    try:
+        # Get MBR from query params
+        mbr_string = request.args.get("mbr", default=None)
+        if not mbr_string:
+            return {"error": "MBR query parameter is required"}, 400
+
+        # Fetch the first matching record
+        sample_record = feature_service.get_sample_record(dataset, mbr_string, include_geometry=False)
+        if not sample_record:
+            return {"error": "No matching record found"}, 404
+
+        return json.dumps(sample_record, indent=2)
+
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    except FileNotFoundError as e:
+        return {"error": str(e)}, 404
+    except Exception as e:
+        return {"error": f"Internal error: {str(e)}"}, 500
+
+@app.get("/datasets/<dataset>/features/sample.geojson")
+def get_sample_with_geometry(dataset):
+    """
+    Return the first record that matches the given MBR, including geometry.
+
+    Query params:
+        mbr: Minimum Bounding Rectangle as "minx,miny,maxx,maxy"
+    """
+    dataset_path = DATA_ROOT / dataset
+
+    if not dataset_path.exists() or not dataset_path.is_dir():
+        return {"error": "Dataset not found"}, 404
+
+    try:
+        # Get MBR from query params
+        mbr_string = request.args.get("mbr", default=None)
+        if not mbr_string:
+            return {"error": "MBR query parameter is required"}, 400
+
+        # Fetch the first matching record with geometry
+        sample_record = feature_service.get_sample_record(dataset, mbr_string, include_geometry=True)
+        if not sample_record:
+            return {"error": "No matching record found"}, 404
+
+        return json.dumps(sample_record, indent=2)
+
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    except FileNotFoundError as e:
+        return {"error": str(e)}, 404
+    except Exception as e:
+        return {"error": f"Internal error: {str(e)}"}, 500
 
 
 if __name__ == "__main__":
