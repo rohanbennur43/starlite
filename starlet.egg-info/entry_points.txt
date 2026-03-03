@@ -1,0 +1,2 @@
+[console_scripts]
+starlet = starlet._cli:main

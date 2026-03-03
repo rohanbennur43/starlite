@@ -1,9 +1,9 @@
 """Streaming MVT generation pipeline: histogram → assign → stream → render."""
 import logging
-from mvt.histogram import HistogramLoader
-from mvt.streamer import GeometryStreamer
-from mvt.assigner import TileAssigner
-from mvt.renderer import TileRenderer
+from starlet._internal.histogram.loader import HistogramLoader
+from .streamer import GeometryStreamer
+from .assigner import TileAssigner
+from .renderer import TileRenderer
 
 logger = logging.getLogger(__name__)
 

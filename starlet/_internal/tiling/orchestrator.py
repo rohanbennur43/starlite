@@ -24,8 +24,8 @@ from .assigner import TileAssignerFromCSV
 from .writer_pool import WriterPool
 from .utils_large import ensure_large_types
 
-from .stats.collector import AttributeStatsCollector
-from .stats.writer import write_attribute_stats
+from starlet._internal.stats.collector import AttributeStatsCollector
+from starlet._internal.stats.writer import write_attribute_stats
 
 
 logger = logging.getLogger(__name__)

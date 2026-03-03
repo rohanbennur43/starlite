@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Dataset Viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+<style>
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+
+  .container {
+    background: white;
+    border-radius: 10px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+    padding: 40px;
+    max-width: 600px;
+    width: 100%;
+  }
+
+  h1 {
+    color: #333;
+    margin-bottom: 10px;
+    text-align: center;
+  }
+
+  .subtitle {
+    text-align: center;
+    color: #666;
+    margin-bottom: 30px;
+    font-size: 14px;
+  }
+
+  .dataset-list {
+    display: grid;
+    gap: 12px;
+  }
+
+  .dataset-item {
+    display: block;
+    padding: 15px 20px;
+    background: #f8f9fa;
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    text-decoration: none;
+    color: #333;
+    transition: all 0.3s ease;
+    cursor: pointer;
+  }
+
+  .dataset-item:hover {
+    background: #667eea;
+    color: white;
+    border-color: #667eea;
+    transform: translateX(5px);
+  }
+
+  .dataset-item strong {
+    display: block;
+    font-size: 16px;
+    margin-bottom: 4px;
+  }
+
+  .dataset-item small {
+    font-size: 12px;
+    opacity: 0.7;
+  }
+
+  .loading {
+    text-align: center;
+    color: #666;
+    padding: 20px;
+  }
+
+  .error {
+    background: #fee;
+    color: #c33;
+    padding: 15px;
+    border-radius: 6px;
+    text-align: center;
+    margin: 20px 0;
+  }
+
+  .search-box {
+    margin-bottom: 20px;
+  }
+
+  #searchInput {
+    width: 100%;
+    padding: 12px;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    font-size: 14px;
+  }
+
+  #searchInput:focus {
+    outline: none;
+    border-color: #667eea;
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+  }
+</style>
+</head>
+
+<body>
+<div class="container">
+  <h1>📍 Dataset Viewer</h1>
+  <p class="subtitle">Select a dataset to visualize</p>
+
+  <div class="search-box">
+    <input 
+      type="text" 
+      id="searchInput" 
+      placeholder="Search datasets..." 
+      autocomplete="off"
+    />
+  </div>
+
+  <div id="content">
+    <div class="loading">Loading datasets...</div>
+  </div>
+</div>
+
+<script>
+  const contentDiv = document.getElementById('content');
+  const searchInput = document.getElementById('searchInput');
+  let allDatasets = [];
+
+  // Fetch and display datasets
+  async function loadDatasets() {
+    try {
+      const response = await fetch('/api/datasets');
+      const data = await response.json();
+      allDatasets = data.datasets;
+
+      if (allDatasets.length === 0) {
+        contentDiv.innerHTML = '<div class="error">No datasets found</div>';
+        return;
+      }
+
+      displayDatasets(allDatasets);
+    } catch (error) {
+      console.error('Error loading datasets:', error);
+      contentDiv.innerHTML = '<div class="error">Failed to load datasets. Make sure the server is running.</div>';
+    }
+  }
+
+  function displayDatasets(datasets) {
+    if (datasets.length === 0) {
+      contentDiv.innerHTML = '<div class="error">No datasets match your search</div>';
+      return;
+    }
+
+    const html = '<div class="dataset-list">' +
+      datasets.map(dataset => `
+        <a href="view_mvt.html?dataset=${encodeURIComponent(dataset)}" class="dataset-item">
+          <strong>${dataset}</strong>
+          <small>Click to view on map</small>
+        </a>
+      `).join('') +
+      '</div>';
+    
+    contentDiv.innerHTML = html;
+  }
+
+  // Search functionality
+  searchInput.addEventListener('input', (e) => {
+    const query = e.target.value.toLowerCase();
+    const filtered = allDatasets.filter(dataset =>
+      dataset.toLowerCase().includes(query)
+    );
+    displayDatasets(filtered);
+  });
+
+  // Load datasets on page load
+  loadDatasets();
+</script>
+
+</body>
+</html>

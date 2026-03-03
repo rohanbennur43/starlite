@@ -1,0 +1,49 @@
+[project]
+name = "starlet"
+version = "0.1.0"
+description = "Spatial tiling, MVT generation, and tile serving for geospatial data"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "pyarrow>=15",
+    "pandas>=2",
+    "numpy>=1.24",
+    "shapely>=2.0",
+    "click>=8",
+    "ijson>=3.3",
+]
+
+[project.optional-dependencies]
+mvt = [
+    "mapbox-vector-tile>=2",
+    "pyproj>=3",
+]
+server = [
+    "flask>=3",
+    "flask-cors",
+    "geopandas>=0.14",
+    "pyproj>=3",
+    "mapbox-vector-tile>=2",
+    "gunicorn",
+    "datasketch",
+]
+llm = [
+    "google-generativeai",
+]
+all = [
+    "starlet[mvt,server,llm]",
+]
+
+[project.scripts]
+starlet = "starlet._cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["starlet*"]
+
+[tool.setuptools.package-data]
+"starlet._internal.server" = ["templates/*.html"]

@@ -2,6 +2,7 @@ from flask import Flask, Response, render_template, send_from_directory, request
 from flask_cors import CORS
 from tiler.tiler import VectorTiler
 from pathlib import Path
+from time import perf_counter
 import argparse
 import os
 import json
@@ -9,6 +10,13 @@ import signal
 import sys
 import logging
 from download_service import DatasetFeatureService
+
+log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, log_level, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # Get the directory where this script is located
 SERVER_DIR = Path(__file__).parent
@@ -32,8 +40,13 @@ def get_tiler(dataset):
 
 @app.get("/<dataset>/<int:z>/<int:x>/<int:y>.mvt")
 def serve_tile(dataset, z, x, y):
+    t0 = perf_counter()
     tiler = get_tiler(dataset)
-    return Response(tiler.get_tile(z, x, y), mimetype="application/vnd.mapbox-vector-tile")
+    data = tiler.get_tile(z, x, y)
+    elapsed_ms = (perf_counter() - t0) * 1000
+    logger.info("[TileRequest] dataset=%s z=%d x=%d y=%d bytes=%d elapsed=%.1fms",
+                dataset, z, x, y, len(data), elapsed_ms)
+    return Response(data, mimetype="application/vnd.mapbox-vector-tile")
 
 @app.get("/api/datasets")
 def list_datasets():
@@ -46,7 +59,7 @@ def list_datasets():
 @app.get("/")
 def index():
     """Serve the index page with dataset list"""
-    logging.info("Serving index page")
+    logger.info("Serving index page")
     return render_template("index.html")
 
 @app.route("/<path:filename>")

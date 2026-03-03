@@ -1,7 +1,7 @@
 """Tile assignment with reservoir sampling for bounded-memory MVT generation."""
 import logging
 from collections import defaultdict
-from mvt.helpers import hist_value_from_prefix, mercator_bounds_to_tile_range
+from .helpers import hist_value_from_prefix, mercator_bounds_to_tile_range
 import random
 
 logger = logging.getLogger(__name__)
