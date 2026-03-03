@@ -1,190 +1,335 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Dataset Viewer</title>
+<title>Starlet</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-
 <style>
-  * {
+  *, *::before, *::after {
     margin: 0;
     padding: 0;
     box-sizing: border-box;
   }
 
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface-hover: #242836;
+    --border: #2a2e3a;
+    --text: #e1e4eb;
+    --text-muted: #8b8fa3;
+    --accent: #6c72cb;
+    --accent-light: #8b8fd8;
+    --tag-polygon: #2d6a4f;
+    --tag-point: #7b2cbf;
+    --tag-line: #d4740e;
+    --tag-default: #3a3e4a;
+  }
+
   body {
-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
     min-height: 100vh;
+  }
+
+  /* ── Header ── */
+  .header {
+    border-bottom: 1px solid var(--border);
+    padding: 20px 32px;
     display: flex;
     align-items: center;
-    justify-content: center;
-    padding: 20px;
+    justify-content: space-between;
+    gap: 24px;
+    flex-wrap: wrap;
   }
 
-  .container {
-    background: white;
-    border-radius: 10px;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
-    padding: 40px;
-    max-width: 600px;
-    width: 100%;
-  }
-
-  h1 {
-    color: #333;
-    margin-bottom: 10px;
-    text-align: center;
-  }
-
-  .subtitle {
-    text-align: center;
-    color: #666;
-    margin-bottom: 30px;
-    font-size: 14px;
-  }
-
-  .dataset-list {
-    display: grid;
+  .header-left {
+    display: flex;
+    align-items: center;
     gap: 12px;
   }
 
-  .dataset-item {
-    display: block;
-    padding: 15px 20px;
-    background: #f8f9fa;
-    border: 1px solid #e0e0e0;
-    border-radius: 6px;
-    text-decoration: none;
-    color: #333;
-    transition: all 0.3s ease;
-    cursor: pointer;
-  }
-
-  .dataset-item:hover {
-    background: #667eea;
-    color: white;
-    border-color: #667eea;
-    transform: translateX(5px);
-  }
-
-  .dataset-item strong {
-    display: block;
+  .logo {
+    width: 32px;
+    height: 32px;
+    background: var(--accent);
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     font-size: 16px;
-    margin-bottom: 4px;
+    font-weight: 700;
+    color: white;
+    flex-shrink: 0;
   }
 
-  .dataset-item small {
-    font-size: 12px;
-    opacity: 0.7;
+  .brand {
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: -0.3px;
   }
 
-  .loading {
-    text-align: center;
-    color: #666;
-    padding: 20px;
+  .search-wrapper {
+    position: relative;
+    width: 320px;
+    flex-shrink: 0;
   }
 
-  .error {
-    background: #fee;
-    color: #c33;
-    padding: 15px;
-    border-radius: 6px;
-    text-align: center;
-    margin: 20px 0;
-  }
-
-  .search-box {
-    margin-bottom: 20px;
+  .search-icon {
+    position: absolute;
+    left: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-muted);
+    font-size: 14px;
+    pointer-events: none;
   }
 
   #searchInput {
     width: 100%;
-    padding: 12px;
-    border: 1px solid #ddd;
-    border-radius: 6px;
+    padding: 9px 12px 9px 36px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  #searchInput::placeholder { color: var(--text-muted); }
+  #searchInput:focus { border-color: var(--accent); }
+
+  /* ── Main ── */
+  .main {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: 32px;
+  }
+
+  .summary {
+    color: var(--text-muted);
+    font-size: 14px;
+    margin-bottom: 20px;
+  }
+
+  .summary strong {
+    color: var(--text);
+  }
+
+  /* ── Dataset Grid ── */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 16px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    text-decoration: none;
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    transition: background 0.15s, border-color 0.15s;
+  }
+
+  .card:hover {
+    background: var(--surface-hover);
+    border-color: var(--accent);
+  }
+
+  .card-top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .card-name {
+    font-size: 15px;
+    font-weight: 600;
+    word-break: break-word;
+  }
+
+  .tag {
+    font-size: 11px;
+    font-weight: 500;
+    padding: 3px 8px;
+    border-radius: 4px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .tag-polygon  { background: var(--tag-polygon); color: #b7e4c7; }
+  .tag-point    { background: var(--tag-point);   color: #e0aaff; }
+  .tag-line     { background: var(--tag-line);    color: #ffe0b2; }
+  .tag-default  { background: var(--tag-default); color: var(--text-muted); }
+
+  .card-meta {
+    display: flex;
+    gap: 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+
+  .card-meta span {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .arrow {
+    color: var(--text-muted);
+    font-size: 18px;
+    margin-left: auto;
+    align-self: center;
+    transition: transform 0.15s, color 0.15s;
+  }
+
+  .card:hover .arrow {
+    transform: translateX(3px);
+    color: var(--accent-light);
+  }
+
+  /* ── States ── */
+  .state-msg {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--text-muted);
     font-size: 14px;
   }
 
-  #searchInput:focus {
-    outline: none;
-    border-color: #667eea;
-    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+  .state-msg .icon {
+    font-size: 32px;
+    margin-bottom: 12px;
+    display: block;
+  }
+
+  .spinner {
+    width: 24px;
+    height: 24px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    margin: 0 auto 12px;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  @media (max-width: 600px) {
+    .header { padding: 16px; }
+    .search-wrapper { width: 100%; }
+    .main { padding: 20px 16px; }
+    .grid { grid-template-columns: 1fr; }
   }
 </style>
 </head>
 
 <body>
-<div class="container">
-  <h1>📍 Dataset Viewer</h1>
-  <p class="subtitle">Select a dataset to visualize</p>
 
-  <div class="search-box">
-    <input 
-      type="text" 
-      id="searchInput" 
-      placeholder="Search datasets..." 
-      autocomplete="off"
-    />
+<header class="header">
+  <div class="header-left">
+    <div class="logo">S</div>
+    <span class="brand">Starlet</span>
   </div>
+  <div class="search-wrapper">
+    <span class="search-icon">&#x1F50D;</span>
+    <input type="text" id="searchInput" placeholder="Search datasets..." autocomplete="off" />
+  </div>
+</header>
 
+<main class="main">
+  <div id="summary" class="summary"></div>
   <div id="content">
-    <div class="loading">Loading datasets...</div>
+    <div class="state-msg"><div class="spinner"></div>Loading datasets...</div>
   </div>
-</div>
+</main>
 
 <script>
-  const contentDiv = document.getElementById('content');
+  const contentDiv  = document.getElementById('content');
+  const summaryDiv  = document.getElementById('summary');
   const searchInput = document.getElementById('searchInput');
-  let allDatasets = [];
+  let allDatasets   = [];
 
-  // Fetch and display datasets
+  function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+  }
+
+  function detectType(name) {
+    const n = name.toUpperCase();
+    if (n.includes('COUNTY') || n.includes('PLACE') || n.includes('STATE') || n.includes('TRACT') || n.includes('ZCTA'))
+      return { label: 'Polygon', cls: 'tag-polygon' };
+    if (n.includes('POINT') || n.includes('LANDMARK'))
+      return { label: 'Point', cls: 'tag-point' };
+    if (n.includes('ROAD') || n.includes('RAIL') || n.includes('EDGE') || n.includes('PRISEC'))
+      return { label: 'Line', cls: 'tag-line' };
+    return { label: 'Dataset', cls: 'tag-default' };
+  }
+
   async function loadDatasets() {
     try {
-      const response = await fetch('/api/datasets');
-      const data = await response.json();
-      allDatasets = data.datasets;
+      const resp = await fetch('/datasets.json');
+      const data = await resp.json();
+      allDatasets = data.datasets || [];
 
       if (allDatasets.length === 0) {
-        contentDiv.innerHTML = '<div class="error">No datasets found</div>';
+        contentDiv.innerHTML = '<div class="state-msg"><span class="icon">&#x1F4C2;</span>No datasets found.<br>Run <code>starlet build</code> to create one.</div>';
         return;
       }
 
       displayDatasets(allDatasets);
-    } catch (error) {
-      console.error('Error loading datasets:', error);
-      contentDiv.innerHTML = '<div class="error">Failed to load datasets. Make sure the server is running.</div>';
+    } catch (err) {
+      console.error(err);
+      contentDiv.innerHTML = '<div class="state-msg"><span class="icon">&#x26A0;</span>Failed to load datasets.<br>Make sure the server is running.</div>';
     }
   }
 
   function displayDatasets(datasets) {
     if (datasets.length === 0) {
-      contentDiv.innerHTML = '<div class="error">No datasets match your search</div>';
+      summaryDiv.innerHTML = '';
+      contentDiv.innerHTML = '<div class="state-msg"><span class="icon">&#x1F50D;</span>No datasets match your search.</div>';
       return;
     }
 
-    const html = '<div class="dataset-list">' +
-      datasets.map(dataset => `
-        <a href="view_mvt.html?dataset=${encodeURIComponent(dataset)}" class="dataset-item">
-          <strong>${dataset}</strong>
-          <small>Click to view on map</small>
-        </a>
-      `).join('') +
+    summaryDiv.innerHTML = '<strong>' + datasets.length + '</strong> dataset' + (datasets.length !== 1 ? 's' : '') + ' available';
+
+    const html = '<div class="grid">' +
+      datasets.map(ds => {
+        const type = detectType(ds.id);
+        return `
+          <a href="view_mvt.html?dataset=${encodeURIComponent(ds.id)}" class="card">
+            <div class="card-top">
+              <span class="card-name">${ds.name}</span>
+              <span class="tag ${type.cls}">${type.label}</span>
+            </div>
+            <div class="card-meta">
+              <span>${formatBytes(ds.size)}</span>
+            </div>
+            <span class="arrow">&rarr;</span>
+          </a>`;
+      }).join('') +
       '</div>';
-    
+
     contentDiv.innerHTML = html;
   }
 
-  // Search functionality
   searchInput.addEventListener('input', (e) => {
-    const query = e.target.value.toLowerCase();
-    const filtered = allDatasets.filter(dataset =>
-      dataset.toLowerCase().includes(query)
-    );
+    const q = e.target.value.toLowerCase();
+    const filtered = allDatasets.filter(ds => ds.id.toLowerCase().includes(q) || ds.name.toLowerCase().includes(q));
     displayDatasets(filtered);
   });
 
-  // Load datasets on page load
   loadDatasets();
 </script>
 
