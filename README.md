@@ -1,163 +1,177 @@
-# Geospatial Data Visualiser
-This repository provides a simple Makefile driven workflow to generate spatial tiles and Mapbox Vector Tiles from Parquet datasets. All steps run through a few make targets and produce logs automatically.
+# Starlet
+
+Spatial tiling, MVT generation, and tile serving for geospatial data.
 
 ## Setup
 
-```shell
+```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ./tile-geoparquet
-pip install -r requirements.txt
+pip install -e ".[all]"
+```
+
+Install only the extras you need:
+
+```bash
+pip install -e ".[server]"   # tile server only
+pip install -e ".[mvt]"      # MVT generation only
+pip install -e ".[llm]"      # LLM styling suggestions
+```
+
+## CLI
+
+All commands are available through the `starlet` CLI.
+
+```bash
+starlet --help
+```
+
+### `starlet tile` — Partition a dataset
+
+```bash
+starlet tile --input data.parquet --outdir datasets/mydata --num-tiles 40
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input` | (required) | Path to GeoParquet or GeoJSON file |
+| `--outdir` | (required) | Output dataset directory |
+| `--num-tiles` | 40 | Target number of spatial partitions |
+| `--partition-size` | 1gb | Target partition size (e.g. 512mb, 1gb) |
+| `--sort` | zorder | Sort order: zorder, hilbert, columns, none |
+| `--sample-cap` | 10000 | Reservoir sampling cap for centroids |
+| `--compression` | zstd | Parquet compression codec |
+
+### `starlet mvt` — Generate vector tiles
+
+```bash
+starlet mvt --dir datasets/mydata --zoom 7 --threshold 100000
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dir` | (required) | Dataset directory with parquet_tiles/ and histograms/ |
+| `--zoom` | 7 | Maximum zoom level |
+| `--threshold` | 0 | Minimum feature count per tile |
+| `--outdir` | `<dir>/mvt/` | MVT output directory |
+
+### `starlet build` — Full pipeline (tile + MVT)
+
+```bash
+starlet build --input data.parquet --outdir datasets/mydata
+```
+
+### `starlet serve` — Launch the tile server
+
+```bash
+starlet serve --dir datasets --port 8765
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dir` | (required) | Root directory containing dataset subdirectories |
+| `--host` | 0.0.0.0 | Host to bind |
+| `--port` | 8765 | Port to bind |
+| `--cache-size` | 256 | In-memory tile cache size |
+
+### `starlet info` — Inspect a dataset
+
+```bash
+starlet info --dir datasets/mydata
 ```
 
 ## Make Targets
 
-### `make tiles INPUT=<input-path>`
-Runs the tiling pipeline.
+Convenience wrappers around the CLI:
 
-- Splits the input dataset into 40 tiles.
-- Uses Z order sorting and sampling.
-- Saves outputs in `datasets/<dataset_name>/`.
-- Writes logs to `logs_<dataset_name>.txt`.
-
-### `make mvt`
-Generates Mapbox Vector Tiles.
-
-- Reads tiles from `datasets/<dataset_name>/`.
-- Writes MVTs to `mvt_out/<dataset_name>/`.
-- Logs are written to the same dataset log file.
-
-### `make all`
-Runs `tiles` followed by `mvt` in one command.
-
-### `make server`
-Starts a Flask server with interactive dataset viewer.
-
-- Serves the `datasets/` directory as MVT tiles
-- Opens `http://127.0.0.1:5000` in your browser
-- Shows an interactive dataset selector with search functionality
-- Automatically detects dataset type and applies appropriate visualization:
-  - **Polygons** (COUNTY, PLACE): State-based coloring with outlines
-  - **Points** (POINTLM): MTFCC category coloring with hover popups
-  - **Lines** (ROADS, RAILS, PRISEC): Color-coded by road type or generic styling
-
-#### Usage
 ```bash
-make server
+make tiles INPUT=path/to/data.parquet
+make mvt   INPUT=path/to/data.parquet
+make build INPUT=path/to/data.parquet   # tiles + mvt
+make server                              # starts on port 8765
+make clean                               # removes datasets/*
 ```
 
-Or manually:
+## API Endpoints
+
+Once the server is running:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Interactive dataset selector |
+| `GET` | `/api/datasets` | List all datasets |
+| `GET` | `/datasets.json` | Search datasets by name |
+| `GET` | `/datasets/<dataset>.json` | Dataset metadata |
+| `GET` | `/datasets/<dataset>.html` | Dataset detail page |
+| `GET` | `/<dataset>/<z>/<x>/<y>.mvt` | Mapbox Vector Tile |
+| `GET` | `/datasets/<dataset>/features.<fmt>` | Download features (csv/geojson) |
+| `POST` | `/datasets/<dataset>/features.<fmt>` | Download with geometry filter |
+| `GET` | `/datasets/<dataset>/features/sample.json` | Sample attributes |
+| `GET` | `/datasets/<dataset>/features/sample.geojson` | Sample record with geometry |
+| `GET` | `/api/datasets/<dataset>/stats` | Attribute statistics |
+| `POST` | `/datasets/<dataset>/styles.json` | LLM-generated styling suggestions |
+
+## LLM Styling Suggestions
+
+The `POST /datasets/<dataset>/styles.json` endpoint uses an LLM to generate
+map styling rules from dataset attribute statistics.
+
+### Provider Selection
+
+Set the `LLM_PROVIDER` environment variable to choose a provider:
+
 ```bash
-source bigdata/bin/activate
-python3 server/server.py --root datasets
+export LLM_PROVIDER=gemini   # default
+export LLM_PROVIDER=ollama   # local Ollama
 ```
 
-Then visit `http://127.0.0.1:5000`
+Falls back to Gemini if the variable is unset or invalid.
 
-#### Dynamic Dataset Loading
-You can also specify a dataset directly via URL:
+### Gemini (default)
+
+Requires a Google AI Studio API key:
+
+```bash
+export GEMINI_API_KEY=your-key-here
+starlet serve --dir datasets
 ```
-http://127.0.0.1:5000/view_mvt.html?dataset=TIGER2018_COUNTY
-http://127.0.0.1:5000/view_mvt.html?dataset=TIGER2018_POINTLM
-http://127.0.0.1:5000/view_mvt.html?dataset=OSM2015_33
+
+### Ollama (local)
+
+Requires a running Ollama instance on the default port (11434):
+
+```bash
+ollama serve                  # start Ollama
+ollama pull llama3            # pull a model (once)
+
+export LLM_PROVIDER=ollama
+starlet serve --dir datasets
 ```
 
-#### API Endpoints
-- `GET /` - Interactive dataset selector page
-- `GET /api/datasets` - Returns JSON list of available datasets
-- `GET /<dataset>/<z>/<x>/<y>.mvt` - Serves MVT tile for specified dataset
-- `GET /view_mvt.html` - Interactive map viewer (use with `?dataset=` param)
+To use a different model:
 
-### `make clean`
-Removes all generated tiles, MVTs, and logs.
+```bash
+export OLLAMA_MODEL=mistral
+```
+
+See [`starlet/_internal/server/llm/README.md`](starlet/_internal/server/llm/README.md) for full LLM provider documentation.
 
 ## Example
+
 ```bash
-make all INPUT=../extras/original_datasets/OSM2015_33.parquet
+# Full pipeline
+starlet build --input ../data/TIGER2018_COUNTY.parquet --outdir datasets/TIGER2018_COUNTY
+
+# Or via Make
+make build INPUT=../data/TIGER2018_COUNTY.parquet
+
+# Start the server
 make server
 ```
 
-Then browse to `http://127.0.0.1:5000` and select a dataset to visualize.
-
-## Features
-
-### Interactive Dataset Selector
-- Browse all available datasets in `datasets/` folder
-- Search/filter datasets by name
-- One-click access to visualization
-
-### Smart Visualization
-The viewer automatically detects geometry types and applies appropriate rendering:
-
-- **Polygons**: Colored by state (STATEFP) with semi-transparent fills and outlines
-- **Points**: Colored by MTFCC category (landmarks, schools, hospitals, etc.) with hover information
-- **Lines**: Styled by type (roads, rails, etc.) with zoom-responsive widths
-
-### Debug Features
-- Fetch request logging in browser console
-- Tile loading state tracking
-- MapLibre GL error reporting
-- Network request inspection
-
-## Styling Guide
-
-For detailed instructions on customizing map styling for Points, Polygons, and Lines, see [server/STYLING_GUIDE.md](server/STYLING_GUIDE.md).
-
-### Quick Examples
-
-**Color counties by state (Polygons):**
-```javascript
-"fill-color": [
-  "match",
-  ["get", "STATEFP"],
-  "06", "#ff0000",  // California
-  "48", "#0000ff",  // Texas
-  "#cccccc"         // Others
-]
-```
-
-**Color landmarks by type (Points):**
-```javascript
-"circle-color": [
-  "match",
-  ["get", "MTFCC"],
-  "K2540", "#ff7f0e",   // Schools
-  "K2543", "#1f77b4",   // Hospitals
-  "#aaaaaa"             // Default
-]
-```
-
-**Color roads by type (Lines):**
-```javascript
-"line-color": [
-  "match",
-  ["get", "RTTYP"],
-  "M", "#ff0000",  // Major roads
-  "S", "#ffa500",  // Secondary
-  "#0066cc"        // Local
-]
-```
-
+Then open http://localhost:8765 and select a dataset to visualize.
 
 ## Prerequisites
 
-### Unix Systems
-- Ensure you have Python 3.6 or higher installed.
-- Install `make` if not already available.
-
-### Non-Unix Systems
-- Install Python 3.6 or higher.
-- Use a compatible `make` alternative or manually execute the commands in the Makefile.
-
-### Activating the Virtual Environment
-- Run the following commands to set up and activate the virtual environment:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-```
-
-### Dataset Requirement
-- Download the required datasets from the UCR STAR repository.
-- Place the datasets in the `datasets/` directory following the structure outlined in this repository.
-Make sure that when a tile is askedd for no data region, empty tile is returned
+- Python 3.10+
+- `make` (optional, for convenience targets)

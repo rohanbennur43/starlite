@@ -28,11 +28,8 @@ server = [
     "gunicorn",
     "datasketch",
 ]
-llm = [
-    "google-generativeai",
-]
 all = [
-    "starlet[mvt,server,llm]",
+    "starlet[mvt,server]",
 ]
 
 [project.scripts]
@@ -47,3 +44,4 @@ include = ["starlet*"]
 
 [tool.setuptools.package-data]
 "starlet._internal.server" = ["templates/*.html"]
+"starlet._internal.server.llm" = ["prompt.md"]
